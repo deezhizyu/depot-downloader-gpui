@@ -424,7 +424,8 @@ fn status_line(message: &str, cx: &mut Context<RootView>) -> AnyElement {
 /// are always plain spaces either way, so whitespace-or-not is what actually
 /// distinguishes the two regardless of encoding.
 fn render_qr_code(ascii_art: &str) -> AnyElement {
-    const MODULE_SIZE: Pixels = px(6.0);
+    const MODULE_SIZE_PX: f32 = 6.0;
+    const PADDING_PX: f32 = 12.0;
 
     let rows = ascii_art
         .lines()
@@ -435,13 +436,24 @@ fn render_qr_code(ascii_art: &str) -> AnyElement {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let columns = rows.first().map_or(0, Vec::len);
+
+    // Explicit width and height (rather than letting the container size to
+    // its content) because this sits inside a `v_flex`, which stretches
+    // children to fill its cross axis - without them the white background
+    // would stretch to the full width of the status area instead of hugging
+    // the square QR grid.
+    let width = columns as f32 * MODULE_SIZE_PX + PADDING_PX * 2.0;
+    let height = rows.len() as f32 * MODULE_SIZE_PX + PADDING_PX * 2.0;
 
     div()
+        .w(px(width))
+        .h(px(height))
         .bg(rgb(0xFFFFFF))
-        .p(px(12.0))
+        .p(px(PADDING_PX))
         .child(v_flex().children(rows.into_iter().map(|row| {
             h_flex().children(row.into_iter().map(|is_dark_module| {
-                div().size(MODULE_SIZE).bg(if is_dark_module {
+                div().size(px(MODULE_SIZE_PX)).bg(if is_dark_module {
                     rgb(0x000000)
                 } else {
                     rgb(0xFFFFFF)

@@ -71,12 +71,22 @@ Steam-client download would look, styled to match Zed's own UI.
   identical characters, and that glyph isn't in IBM Plex Mono, so text rendering produced a blank
   area even once the text itself was captured correctly. `render_qr_code` instead samples one
   character per module (`step_by(2)`) and draws each module as an explicit black/white square
-  `div`, which is correct regardless of font or encoding and reads reliably by a phone camera. It
-  then blocks silently waiting for the phone to confirm the scan, so no line ever
+  `div`, which is correct regardless of font or encoding and reads reliably by a phone camera.
+  Its container gets an explicit pixel width and height computed from the module grid, rather
+  than sizing to content, because it sits inside a `v_flex` that stretches children to fill its
+  cross axis - without that it would stretch to the status area's full width instead of staying
+  square. It then blocks silently waiting for the phone to confirm the scan, so no line ever
   marks where the block ends either — `process::run`'s read loop races a short idle timer
   (`QR_FLUSH_IDLE_TIMEOUT`) against new output and calls
   `OutputParser::flush_pending_qr_block` once things go quiet, rather than waiting for a
-  terminator that will never come.
+  terminator that will never come. That idle timer is a single absolute `Instant` deadline
+  carried across the whole loop and advanced only when a real output line arrives - never by a
+  disk-usage sample. It has to work this way: disk usage is polled unconditionally every
+  `DISK_POLL_INTERVAL` (500ms), faster than `QR_FLUSH_IDLE_TIMEOUT` (700ms), for as long as a
+  download directory is set (the common case), so a naively-recreated `Timer::after(...)` on
+  every loop iteration gets restarted by each disk sample before it can ever elapse - the QR
+  never idle-flushes at all, and in practice only ever appeared once some unrelated line (like
+  the next QR refresh's own heading) happened to end the block for a different reason.
 - **Reading the child's stdout/stderr is byte-based, not `AsyncBufReadExt::lines()`**
   (`depot_downloader::process::forward_lines`): `lines()` silently ends its whole stream the
   moment one line fails strict UTF-8 decoding, which would permanently kill that reader task
