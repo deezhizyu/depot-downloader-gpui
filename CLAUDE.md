@@ -124,7 +124,14 @@ Steam-client download would look, styled to match Zed's own UI.
 ```
 src/
   main.rs                       Entry point: opens the window, installs the theme
-  app.rs                        The single root view (form + status/progress area)
+  app/
+    mod.rs                      RootView: fields, construction, top-level layout
+    state.rs                    LoginMode, RunState, PendingControl
+    session.rs                  Provisioning, start/resume/launch, pause/cancel, logout, Steam Guard submit
+    process_events.rs           Applies ProcessEvents to RunState and Config
+    form.rs                     Left column: app id, library folder, login section
+    status.rs                   Right column: progress, controls, prompts
+    qr_code.rs                  Draws the QR login code
   config.rs                     Persisted settings
   theme.rs                      Applies assets/theme/zed_one_dark.json to gpui-component
   steam/
