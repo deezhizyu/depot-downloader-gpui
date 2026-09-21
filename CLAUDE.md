@@ -108,10 +108,19 @@ Steam-client download would look, styled to match Zed's own UI.
   disk throughput by the compressed/uncompressed byte ratio learned from depots that have already
   finished (1:1 until the first one completes, since that's the only place DepotDownloader reports
   both figures). ETA is derived from the current depot's percent-per-second rate directly, not
-  from a byte estimate, since a depot's total size is never printed while it's running. A Steam
-  Guard prompt or QR code is cleared from `DownloadStats` as soon as real depot activity resumes
-  (`ProcessingDepot`/`DownloadingDepot`/`FileProgress`), since otherwise it would stay set for the
-  rest of the run and permanently block the progress view from showing.
+  from a byte estimate, since a depot's total size is never printed while it's running. Both speed
+  figures only ever update on genuine growth (strictly more bytes than the oldest sample still in
+  the smoothing window, not merely as-many) — a large single file can go longer than the window
+  between DepotDownloader's own percent-line updates even while it keeps writing the whole time,
+  which ages every sample down to the same value; requiring real growth to update means that
+  case holds the last known speed instead of flashing to a wrong, literal 0 B/s until the next
+  update ticks. A Steam Guard prompt or QR code is cleared from `DownloadStats` as soon as any
+  further output arrives (`DownloadEvent::OtherOutput`, the fallback `parser::parse_plain_line`
+  produces for the many lines - license counts, depot key results, manifest details, and so on -
+  that don't map to any specific event), not only on a recognized depot-activity event: DepotDownloader
+  stays completely silent while a prompt is pending, so any line at all is proof it's done, and
+  waiting for a specific event left the prompt on screen through everything printed between a
+  successful login and the first depot actually starting.
 - **Console logging**: `depot_downloader::process` and `provisioning` print `eprintln!` lines
   (DepotDownloader's own stdout/stderr verbatim, plus the launch command with the password
   redacted, exit status, and provisioning steps) so a stuck or confusing run can be diagnosed by
