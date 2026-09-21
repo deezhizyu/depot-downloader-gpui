@@ -3,15 +3,14 @@ use std::path::PathBuf;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-/// Settings persisted between launches: what the user typed last time, and
-/// where the auto-provisioned DepotDownloader binary ended up so we do not
-/// download it again on every start.
+/// Settings persisted between launches: what the user typed last time and
+/// the remembered login.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub last_app_id: String,
     pub last_download_location: Option<PathBuf>,
-    pub depot_downloader_binary: Option<PathBuf>,
+    pub last_max_downloads: String,
     /// The Steam account name of a remembered login (see
     /// `depot_downloader::process::LoginMethod::RememberedUsername`), or `None`
     /// if the user hasn't logged in yet or has logged out.

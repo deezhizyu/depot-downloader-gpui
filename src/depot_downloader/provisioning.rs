@@ -1,27 +1,26 @@
 use std::path::{Path, PathBuf};
 
-use crate::config::Config;
-
+/// Our fork of SteamRE/DepotDownloader, which adds the `-json` output mode
+/// this app's progress numbers come from.
 const RELEASE_BASE_URL: &str =
-    "https://github.com/SteamRE/DepotDownloader/releases/latest/download";
+    "https://github.com/deezhizyu/depot-downloader/releases/latest/download";
 
 /// Returns the path to a working DepotDownloader executable, downloading and
 /// extracting the current GitHub release for this platform the first time.
 ///
 /// Runs blocking I/O (network + zip extraction) and should be called from a
 /// background thread, e.g. via `cx.background_spawn`.
-pub fn ensure_binary(config: &mut Config) -> anyhow::Result<PathBuf> {
-    if let Some(path) = &config.depot_downloader_binary
-        && path.is_file()
-    {
+pub fn ensure_binary() -> anyhow::Result<PathBuf> {
+    let install_dir = install_dir()?;
+    let binary_path = install_dir.join(binary_file_name());
+    if binary_path.is_file() {
         eprintln!(
             "[depot-downloader-gpui] using previously provisioned DepotDownloader at {}",
-            path.display()
+            binary_path.display()
         );
-        return Ok(path.clone());
+        return Ok(binary_path);
     }
 
-    let install_dir = install_dir()?;
     std::fs::create_dir_all(&install_dir)?;
 
     let archive_path = install_dir.join(asset_file_name());
@@ -32,23 +31,20 @@ pub fn ensure_binary(config: &mut Config) -> anyhow::Result<PathBuf> {
         "[depot-downloader-gpui] extracting {}",
         archive_path.display()
     );
-    let binary_path = extract_binary(&archive_path, &install_dir)?;
+    extract_binary(&archive_path, &binary_path)?;
     make_executable(&binary_path)?;
     let _ = std::fs::remove_file(&archive_path);
     eprintln!(
         "[depot-downloader-gpui] DepotDownloader ready at {}",
         binary_path.display()
     );
-
-    config.depot_downloader_binary = Some(binary_path.clone());
-    config.save();
     Ok(binary_path)
 }
 
 fn install_dir() -> anyhow::Result<PathBuf> {
     let dirs = crate::config::project_dirs()
         .ok_or_else(|| anyhow::anyhow!("could not determine a data directory for this platform"))?;
-    Ok(dirs.data_dir().join("depot-downloader"))
+    Ok(dirs.data_dir().join("depot-downloader-fork"))
 }
 
 fn asset_file_name() -> String {
@@ -94,7 +90,7 @@ fn download_release_asset(url: &str, destination: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn extract_binary(archive_path: &Path, destination_dir: &Path) -> anyhow::Result<PathBuf> {
+fn extract_binary(archive_path: &Path, binary_path: &Path) -> anyhow::Result<()> {
     let file = std::fs::File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(file)?;
     let binary_name = binary_file_name();
@@ -107,10 +103,9 @@ fn extract_binary(archive_path: &Path, destination_dir: &Path) -> anyhow::Result
         if entry_path.file_name().and_then(|name| name.to_str()) != Some(binary_name) {
             continue;
         }
-        let binary_path = destination_dir.join(binary_name);
-        let mut out_file = std::fs::File::create(&binary_path)?;
+        let mut out_file = std::fs::File::create(binary_path)?;
         std::io::copy(&mut entry, &mut out_file)?;
-        return Ok(binary_path);
+        return Ok(());
     }
 
     anyhow::bail!("{binary_name} was not found inside the downloaded DepotDownloader archive")

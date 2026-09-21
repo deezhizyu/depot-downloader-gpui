@@ -1,21 +1,17 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use async_process::{Command, Stdio};
+use futures_lite::StreamExt;
 use futures_lite::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use super::parser::OutputParser;
+use super::event::EventLine;
 use super::progress::{DownloadStats, ProgressTracker};
 
-/// How often we re-measure the download directory's size on disk.
-const DISK_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-/// How long to wait for more output before assuming a pending QR code block
-/// is complete. DepotDownloader prints the QR and then blocks silently
-/// waiting for the phone to confirm the scan, so nothing ever marks the
-/// block's end in the text itself.
-const QR_FLUSH_IDLE_TIMEOUT: Duration = Duration::from_millis(700);
+/// How often speeds are re-measured while the fork reports no new counters,
+/// so they fall to zero during a stall instead of freezing on the last value.
+const SPEED_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub enum LoginMethod {
@@ -37,14 +33,13 @@ pub struct DownloadRequest {
     pub depot_downloader_binary: PathBuf,
     pub app_id: String,
     pub download_dir: Option<PathBuf>,
+    pub max_downloads: Option<u32>,
     pub login: LoginMethod,
 }
 
 impl DownloadRequest {
     fn build_args(&self) -> Vec<String> {
-        // -debug enables per-chunk "Downloading chunk ..." lines, the
-        // finest-grained progress signal DepotDownloader offers - see
-        // ProgressTracker::record_chunk_download_started for what it buys us.
+        // -json makes stdout carry only exact machine-readable events.
         // -remember-password is unconditional: it's what makes DepotDownloader
         // persist a login token to account.config after any successful login
         // (password or QR alike), which is what LoginMethod::RememberedUsername
@@ -53,12 +48,16 @@ impl DownloadRequest {
         let mut args = vec![
             "-app".to_string(),
             self.app_id.clone(),
-            "-debug".to_string(),
+            "-json".to_string(),
             "-remember-password".to_string(),
         ];
         if let Some(dir) = &self.download_dir {
             args.push("-dir".to_string());
             args.push(dir.to_string_lossy().into_owned());
+        }
+        if let Some(max_downloads) = self.max_downloads {
+            args.push("-max-downloads".to_string());
+            args.push(max_downloads.to_string());
         }
         match &self.login {
             LoginMethod::UsernamePassword { username, password } => {
@@ -89,10 +88,9 @@ impl DownloadRequest {
     }
 }
 
-// `DownloadStats` naturally accumulates fields as this app's data model
-// grows, and a `Stats` event is only ever sent a few times a second over an
-// async channel - not a hot path where boxing it to shrink this enum would
-// buy anything real.
+// A `Stats` event is sent at most a few dozen times a second over an async
+// channel - not a hot path where boxing it to shrink this enum would buy
+// anything real.
 #[allow(clippy::large_enum_variant)]
 pub enum ProcessEvent {
     Stats(DownloadStats),
@@ -182,30 +180,11 @@ pub async fn run(
     })
     .detach();
 
-    let (disk_tx, disk_rx) = async_channel::unbounded::<u64>();
-    if let Some(dir) = request.download_dir.clone() {
-        smol::spawn(poll_disk_usage(dir, disk_tx)).detach();
-    }
-
-    let mut parser = OutputParser::new();
     let mut tracker = ProgressTracker::new();
-    // Only pushed forward by real output (`Sample::Line`), never by a disk
-    // sample - see `next_sample`'s doc comment for why that distinction matters.
-    let mut qr_idle_deadline = Instant::now() + QR_FLUSH_IDLE_TIMEOUT;
+    let mut speed_refresh = smol::Timer::interval(SPEED_REFRESH_INTERVAL);
 
     loop {
-        // Drained unconditionally, before racing anything else in
-        // `next_sample`, so a burst of `-debug` diagnostic noise on
-        // `line_rx` (see `next_sample`'s doc comment) can never starve disk
-        // polling the way it could when a disk sample was just another arm
-        // of that race.
-        let mut stats_changed = false;
-        while let Ok(bytes) = disk_rx.try_recv() {
-            tracker.apply_disk_sample(bytes, Instant::now());
-            stats_changed = true;
-        }
-
-        match next_sample(&line_rx, &cancel, qr_idle_deadline).await {
+        let stats_changed = match next_sample(&line_rx, &cancel, &mut speed_refresh).await {
             Sample::CancelRequested => {
                 eprintln!(
                     "[depot-downloader-gpui] stopping DepotDownloader (pause/cancel requested)"
@@ -213,28 +192,16 @@ pub async fn run(
                 let _ = child.kill();
                 break;
             }
-            Sample::Line(line) => {
-                qr_idle_deadline = Instant::now() + QR_FLUSH_IDLE_TIMEOUT;
-                let events = parser.feed(&line);
-                // `-debug` also enables .NET's HttpClient diagnostics, which
-                // produce no event at all (see `parser::dotnet_diagnostic_noise`).
-                // Not treating those as a change keeps a fast download from
-                // triggering a Stats resend + re-render on every single one.
-                stats_changed |= !events.is_empty();
-                for event in events {
-                    tracker.apply_event(event);
+            Sample::Line(line) => match serde_json::from_str::<EventLine>(&line) {
+                Ok(event_line) => {
+                    tracker.apply(event_line, Instant::now());
+                    true
                 }
-            }
-            Sample::Idle => {
-                qr_idle_deadline = Instant::now() + QR_FLUSH_IDLE_TIMEOUT;
-                if let Some(event) = parser.flush_pending_qr_block() {
-                    eprintln!("[depot-downloader-gpui] QR code ready (no further output arrived)");
-                    tracker.apply_event(event);
-                    stats_changed = true;
-                }
-            }
+                Err(_) => false,
+            },
+            Sample::SpeedRefreshDue => tracker.refresh_speeds(Instant::now()),
             Sample::LineChannelClosed => break,
-        }
+        };
 
         if stats_changed
             && updates
@@ -243,6 +210,10 @@ pub async fn run(
                 .is_err()
         {
             return;
+        }
+        if tracker.stats().login_expired {
+            let _ = child.kill();
+            break;
         }
     }
 
@@ -253,44 +224,18 @@ pub async fn run(
 
 enum Sample {
     Line(String),
-    Idle,
+    SpeedRefreshDue,
     LineChannelClosed,
     CancelRequested,
 }
 
-/// Disk samples are deliberately not one of this function's arms - they're
-/// drained separately, non-blockingly, at the top of every iteration of
-/// `run`'s loop, specifically so line volume can never delay or starve them.
-/// An earlier version raced a `next_disk_sample` future here alongside
-/// `next_line`, but `futures_lite::future::or` always polls its first
-/// argument first and returns immediately if it's ready: once `-debug` was
-/// added and its diagnostic output could keep `line_rx` continuously
-/// non-empty, `next_disk_sample` stopped being polled at all for as long as
-/// that backlog lasted, and `Downloaded`/`Download speed`/`Disk speed`
-/// froze at zero for the whole run.
-///
-/// `qr_idle_deadline` is an absolute point in time, carried across every call
-/// from `run`'s loop and advanced only when a `Sample::Line` is actually
-/// processed - never by a disk sample. An earlier version built a fresh
-/// `Timer::after(QR_FLUSH_IDLE_TIMEOUT)` on every call instead, so each disk
-/// sample - not real DepotDownloader output - restarted its 700ms window
-/// before it could ever elapse, starving the QR flush indefinitely: the QR
-/// code silently never appeared until something else (like the next QR
-/// refresh's own heading) happened to end the block for an unrelated reason.
-/// Racing the idle tick as the *first* argument to `or` also matters: once
-/// `qr_idle_deadline` has passed, that guarantees it wins even in the instant
-/// a line also happens to be ready, since `or` favors whichever argument it
-/// polls first.
-///
-/// `cancel_rx` is also raced in here, rather than only drained at the top of
-/// the loop the way disk samples are: a user-initiated pause/cancel click is
-/// never frequent enough to risk the starvation class of bug fixed for disk
-/// polling, and racing it keeps reaction time near-instant even in the
-/// middle of a long QR wait.
+/// Racing `speed_refresh` before `line_rx` matters: `or` polls its first
+/// argument first, so a continuously busy `line_rx` could otherwise starve the
+/// refresh forever.
 async fn next_sample(
     line_rx: &async_channel::Receiver<String>,
     cancel_rx: &async_channel::Receiver<()>,
-    qr_idle_deadline: Instant,
+    speed_refresh: &mut smol::Timer,
 ) -> Sample {
     let next_line = async {
         match line_rx.recv().await {
@@ -298,15 +243,19 @@ async fn next_sample(
             Err(_) => Sample::LineChannelClosed,
         }
     };
-    let idle_tick = async {
-        smol::Timer::at(qr_idle_deadline).await;
-        Sample::Idle
+    let refresh_due = async {
+        speed_refresh.next().await;
+        Sample::SpeedRefreshDue
     };
-    let cancel_tick = async {
+    let cancel_requested = async {
         let _ = cancel_rx.recv().await;
         Sample::CancelRequested
     };
-    futures_lite::future::or(cancel_tick, futures_lite::future::or(idle_tick, next_line)).await
+    futures_lite::future::or(
+        cancel_requested,
+        futures_lite::future::or(refresh_due, next_line),
+    )
+    .await
 }
 
 /// Reads raw bytes and splits on `\n` ourselves, rather than using
@@ -339,38 +288,4 @@ async fn forward_lines(
             }
         }
     }
-}
-
-async fn poll_disk_usage(dir: PathBuf, sink: async_channel::Sender<u64>) {
-    eprintln!(
-        "[depot-downloader-gpui] watching disk usage of {}",
-        dir.display()
-    );
-    loop {
-        let scan_dir = dir.clone();
-        let size = smol::unblock(move || directory_size(&scan_dir)).await;
-        if sink.send(size).await.is_err() {
-            break;
-        }
-        smol::Timer::after(DISK_POLL_INTERVAL).await;
-    }
-}
-
-fn directory_size(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| {
-            let Ok(metadata) = entry.metadata() else {
-                return 0;
-            };
-            if metadata.is_dir() {
-                directory_size(&entry.path())
-            } else {
-                metadata.len()
-            }
-        })
-        .sum()
 }

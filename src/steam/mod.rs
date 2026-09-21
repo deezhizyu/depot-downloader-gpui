@@ -1,3 +1,5 @@
+mod app_info;
 mod library_path;
 
-pub use library_path::default_download_dir_for_app;
+pub use app_info::fetch_install_dir_name;
+pub use library_path::default_steam_common_dir;

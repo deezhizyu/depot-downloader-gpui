@@ -3,14 +3,15 @@ use std::path::{Path, PathBuf};
 use gpui_kit::base::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::{ActiveTheme, TitleBar, WindowExt, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Root, TitleBar, WindowExt, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use qrcode::{Color, QrCode};
 
 use crate::config::Config;
 use crate::depot_downloader::process;
 use crate::depot_downloader::{
-    AuthPrompt, DownloadRequest, DownloadStats, LoginMethod, ProcessEvent, provisioning,
+    AuthPromptKind, DownloadRequest, DownloadStats, LoginMethod, ProcessEvent, provisioning,
 };
 use crate::steam;
 use crate::ui::{format_bytes, format_eta, format_speed};
@@ -23,14 +24,17 @@ enum LoginMode {
 
 enum RunState {
     PreparingDepotDownloader,
+    /// Between clicking Download and launching DepotDownloader: the app's
+    /// install folder and sizes are being looked up. No process exists yet, so
+    /// there is nothing for Pause/Cancel to act on.
+    LookingUpApp,
     Idle,
     Running(DownloadStats),
     ShowingQrCode {
-        ascii_art: String,
+        url: String,
     },
-    AwaitingSteamGuardCode,
-    AwaitingSteamGuardEmailCode {
-        email: String,
+    AwaitingSteamGuardCode {
+        message: String,
     },
     AwaitingSteamGuardConfirmation,
     /// The process was stopped by our own `request_pause`, not by
@@ -59,17 +63,13 @@ pub struct RootView {
     password_input: Entity<InputState>,
     app_id_input: Entity<InputState>,
     download_dir_input: Entity<InputState>,
+    max_downloads_input: Entity<InputState>,
     guard_code_input: Entity<InputState>,
     depot_downloader_binary: Option<PathBuf>,
     run_state: RunState,
     respond_sender: Option<async_channel::Sender<String>>,
     cancel_sender: Option<async_channel::Sender<()>>,
     pending_control: Option<PendingControl>,
-    /// The username a `Stats` update should be credited to once login is
-    /// confirmed (see `apply_process_event`): the form's username for
-    /// `UsernamePassword`/`RememberedUsername`, or `None` for `Qr` (where it
-    /// isn't known until DepotDownloader itself reports it).
-    pending_login_username: Option<String>,
     /// The request behind the currently running/paused download, so
     /// `resume_download` can relaunch it without asking the user to fill the
     /// form in again.
@@ -92,17 +92,21 @@ impl RootView {
                 .default_value(config.last_app_id.clone())
         });
 
-        let default_download_dir = config.last_download_location.clone().or_else(|| {
-            (!config.last_app_id.is_empty())
-                .then(|| steam::default_download_dir_for_app(&config.last_app_id))
-                .flatten()
-        });
+        let default_download_dir = config
+            .last_download_location
+            .clone()
+            .or_else(steam::default_steam_common_dir);
         let download_dir_input = cx.new(|cx| {
             let state = InputState::new(window, cx).placeholder("Download location");
             match &default_download_dir {
                 Some(dir) => state.default_value(dir.to_string_lossy().into_owned()),
                 None => state,
             }
+        });
+        let max_downloads_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Concurrent downloads, default 8")
+                .default_value(config.last_max_downloads.clone())
         });
         let guard_code_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Steam Guard code"));
@@ -114,13 +118,13 @@ impl RootView {
             password_input,
             app_id_input,
             download_dir_input,
+            max_downloads_input,
             guard_code_input,
             depot_downloader_binary: None,
             run_state: RunState::PreparingDepotDownloader,
             respond_sender: None,
             cancel_sender: None,
             pending_control: None,
-            pending_login_username: None,
             last_request: None,
         };
         view.start_provisioning(cx);
@@ -128,18 +132,14 @@ impl RootView {
     }
 
     fn start_provisioning(&self, cx: &mut Context<Self>) {
-        let mut config = self.config.clone();
         cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_executor()
-                .spawn(async move {
-                    provisioning::ensure_binary(&mut config).map(|path| (path, config))
-                })
+                .spawn(async { provisioning::ensure_binary() })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 match outcome {
-                    Ok((path, config)) => {
-                        view.config = config;
+                    Ok(path) => {
                         view.depot_downloader_binary = Some(path);
                         view.run_state = RunState::Idle;
                     }
@@ -166,10 +166,26 @@ impl RootView {
             return;
         }
 
-        let download_dir = {
+        let library_dir = {
             let raw = self.download_dir_input.read(cx).value();
             let trimmed = raw.trim();
             (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+        };
+
+        let max_downloads_text = self.max_downloads_input.read(cx).value().trim().to_string();
+        let max_downloads = if max_downloads_text.is_empty() {
+            None
+        } else {
+            match max_downloads_text.parse::<u32>() {
+                Ok(count) if count > 0 => Some(count),
+                _ => {
+                    self.run_state = RunState::Failed(
+                        "Max downloads must be a whole number greater than 0.".to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
+            }
         };
 
         let login = if let Some(username) = self.config.logged_in_username.clone() {
@@ -185,16 +201,28 @@ impl RootView {
         };
 
         self.config.last_app_id = app_id.clone();
-        self.config.last_download_location = download_dir.clone();
+        self.config.last_download_location = library_dir.clone();
+        self.config.last_max_downloads = max_downloads_text;
         self.config.save();
 
-        let request = DownloadRequest {
-            depot_downloader_binary: binary,
-            app_id,
-            download_dir,
-            login,
-        };
-        self.launch(request, cx);
+        self.run_state = RunState::LookingUpApp;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let lookup_app_id = app_id.clone();
+            let install_dir_name = cx
+                .background_executor()
+                .spawn(async move { steam::fetch_install_dir_name(&lookup_app_id) })
+                .await;
+            let request = DownloadRequest {
+                depot_downloader_binary: binary,
+                app_id,
+                download_dir: library_dir.map(|dir| dir.join(install_dir_name)),
+                max_downloads,
+                login,
+            };
+            let _ = this.update(cx, |view, cx| view.launch(request, cx));
+        })
+        .detach();
     }
 
     /// Relaunches the download that was paused, reusing everything about it
@@ -218,11 +246,6 @@ impl RootView {
     /// `apply_process_event`. Shared by `start_download` and `resume_download`
     /// so channel setup isn't duplicated between them.
     fn launch(&mut self, request: DownloadRequest, cx: &mut Context<Self>) {
-        self.pending_login_username = match &request.login {
-            LoginMethod::UsernamePassword { username, .. }
-            | LoginMethod::RememberedUsername { username } => Some(username.clone()),
-            LoginMethod::Qr => None,
-        };
         self.last_request = Some(request.clone());
 
         let (update_tx, update_rx) = async_channel::unbounded();
@@ -271,6 +294,13 @@ impl RootView {
     }
 
     fn request_cancel(&mut self, cx: &mut Context<Self>) {
+        // A paused download has no process left to signal; waiting for an exit
+        // event that will never come would leave the UI stuck on "Cancelling…".
+        if matches!(self.run_state, RunState::Paused(_)) {
+            self.run_state = RunState::Idle;
+            cx.notify();
+            return;
+        }
         self.send_control_signal(cx);
         self.pending_control = Some(PendingControl::Cancelling);
         cx.notify();
@@ -318,42 +348,38 @@ impl RootView {
                 }
             },
             ProcessEvent::Stats(stats) => {
-                let new_state = if let Some(ascii_art) = stats.qr_code_ascii_art.clone() {
-                    RunState::ShowingQrCode { ascii_art }
-                } else if let Some(prompt) = stats.auth_prompt.clone() {
-                    match prompt {
-                        AuthPrompt::Code => RunState::AwaitingSteamGuardCode,
-                        AuthPrompt::EmailCode { email } => {
-                            RunState::AwaitingSteamGuardEmailCode { email }
-                        }
-                        AuthPrompt::Confirmation => RunState::AwaitingSteamGuardConfirmation,
-                    }
-                } else if let Some(message) = stats.error_message.clone() {
-                    RunState::Failed(message)
-                } else if stats.is_finished {
-                    RunState::Finished(stats.clone())
-                } else {
-                    RunState::Running(stats.clone())
-                };
-
-                // Login is unambiguously behind us once we reach real progress
-                // (every prompt/error slot on `stats` is empty) - a bad
-                // password or rejected QR scan never gets here, so this can
-                // never remember a login that didn't actually work.
-                if matches!(new_state, RunState::Running(_) | RunState::Finished(_)) {
-                    let username = self
-                        .pending_login_username
-                        .clone()
-                        .or(stats.qr_resolved_username.clone());
-                    if let Some(username) = username
-                        && self.config.logged_in_username.as_ref() != Some(&username)
-                    {
-                        self.config.logged_in_username = Some(username);
-                        self.config.save();
-                    }
+                // Only a successful login reports a username, so a bad
+                // password or rejected QR scan can never poison the remembered
+                // account.
+                if let Some(username) = &stats.logged_in_username
+                    && self.config.logged_in_username.as_ref() != Some(username)
+                {
+                    self.config.logged_in_username = Some(username.clone());
+                    self.config.save();
+                }
+                if stats.login_expired {
+                    self.config.logged_in_username = None;
+                    self.config.save();
                 }
 
-                self.run_state = new_state;
+                self.run_state = if let Some(url) = stats.qr_url {
+                    RunState::ShowingQrCode { url }
+                } else if let Some(prompt) = stats.auth_prompt {
+                    match prompt.kind {
+                        AuthPromptKind::DeviceConfirmation => {
+                            RunState::AwaitingSteamGuardConfirmation
+                        }
+                        _ => RunState::AwaitingSteamGuardCode {
+                            message: prompt.message,
+                        },
+                    }
+                } else if let Some(message) = stats.error_message {
+                    RunState::Failed(message)
+                } else if stats.is_finished {
+                    RunState::Finished(stats)
+                } else {
+                    RunState::Running(stats)
+                };
             }
         }
     }
@@ -363,7 +389,7 @@ impl RootView {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Choose a download location".into()),
+            prompt: Some("Choose a library folder".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(mut paths))) = paths.await else {
@@ -469,10 +495,15 @@ impl RootView {
     fn render_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_busy = matches!(
             self.run_state,
-            RunState::PreparingDepotDownloader | RunState::Running(_) | RunState::Paused(_)
+            RunState::PreparingDepotDownloader
+                | RunState::LookingUpApp
+                | RunState::Running(_)
+                | RunState::Paused(_)
         );
         let download_button_label = match self.run_state {
-            RunState::PreparingDepotDownloader | RunState::Running(_) => "Working…",
+            RunState::PreparingDepotDownloader | RunState::LookingUpApp | RunState::Running(_) => {
+                "Working…"
+            }
             RunState::Paused(_) => "Paused",
             _ => "Download",
         };
@@ -483,7 +514,7 @@ impl RootView {
                 Input::new(&self.app_id_input),
             ))
             .child(labeled_field(
-                "Download location",
+                "Library folder (game installs in its own subfolder)",
                 h_flex()
                     .gap_2()
                     .child(div().flex_1().child(Input::new(&self.download_dir_input)))
@@ -494,6 +525,10 @@ impl RootView {
                                 view.browse_for_download_dir(window, cx);
                             })),
                     ),
+            ))
+            .child(labeled_field(
+                "Max concurrent downloads (optional)",
+                Input::new(&self.max_downloads_input),
             ))
             .child(self.render_login_section(cx))
             .child(
@@ -508,17 +543,15 @@ impl RootView {
     fn render_status(&self, cx: &mut Context<Self>) -> AnyElement {
         match &self.run_state {
             RunState::PreparingDepotDownloader => status_line("Setting up DepotDownloader…", cx),
+            RunState::LookingUpApp => status_line("Looking up app…", cx),
             RunState::Idle => div().into_any_element(),
-            RunState::ShowingQrCode { ascii_art } => v_flex()
+            RunState::ShowingQrCode { url } => v_flex()
                 .gap_2()
                 .child("Scan this with the Steam Mobile app:")
-                .child(render_qr_code(ascii_art))
+                .child(render_qr_code(url))
                 .into_any_element(),
-            RunState::AwaitingSteamGuardCode => {
-                self.render_guard_code_prompt("Enter your Steam Guard code", cx)
-            }
-            RunState::AwaitingSteamGuardEmailCode { email } => {
-                self.render_guard_code_prompt(&format!("Enter the code emailed to {email}"), cx)
+            RunState::AwaitingSteamGuardCode { message } => {
+                self.render_guard_code_prompt(message, cx)
             }
             RunState::AwaitingSteamGuardConfirmation => {
                 status_line("Confirm this sign-in in the Steam Mobile app…", cx)
@@ -627,7 +660,7 @@ impl RootView {
 }
 
 impl Render for RootView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .id("root")
             .size_full()
@@ -642,6 +675,9 @@ impl Render for RootView {
                     .child(self.render_form(cx))
                     .child(self.render_status(cx)),
             )
+            // Without this layer `open_alert_dialog` (the Cancel confirmation)
+            // registers its dialog but nothing ever draws it.
+            .children(Root::render_dialog_layer(window, cx))
     }
 }
 
@@ -656,55 +692,41 @@ fn status_line(message: &str, cx: &mut Context<RootView>) -> AnyElement {
         .into_any_element()
 }
 
-/// DepotDownloader renders its QR code as terminal block art, with each
-/// module drawn as two identical characters (`"██"` or `"  "`) so it reads
-/// roughly square in a typical terminal font. Rendering that text verbatim
-/// depends on the UI font having a glyph for U+2588 FULL BLOCK, which
-/// IBM Plex Mono does not - so instead this samples one character per module
-/// (`step_by(2)`) and draws each module as an explicit black/white square,
-/// which is correct regardless of font and reads reliably by a phone camera.
-///
-/// A module is "dark" whenever its sampled character isn't whitespace,
-/// rather than checking for the literal `'█'` glyph: on some platforms that
-/// character doesn't survive DepotDownloader's stdout as valid UTF-8 (it can
-/// decode to the Unicode replacement character instead), but light modules
-/// are always plain spaces either way, so whitespace-or-not is what actually
-/// distinguishes the two regardless of encoding.
-fn render_qr_code(ascii_art: &str) -> AnyElement {
+/// Draws each QR module as an explicit black/white square, which is correct
+/// regardless of font and reads reliably by a phone camera.
+fn render_qr_code(url: &str) -> AnyElement {
     const MODULE_SIZE_PX: f32 = 6.0;
     const PADDING_PX: f32 = 12.0;
 
-    let rows = ascii_art
-        .lines()
-        .map(|line| {
-            line.chars()
-                .step_by(2)
-                .map(|glyph| !glyph.is_whitespace())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let columns = rows.first().map_or(0, Vec::len);
+    let Ok(code) = QrCode::new(url) else {
+        return div()
+            .child("Could not draw the QR code.")
+            .into_any_element();
+    };
+    let columns = code.width();
+    let modules = code.to_colors();
 
     // Explicit width and height (rather than letting the container size to
     // its content) because this sits inside a `v_flex`, which stretches
     // children to fill its cross axis - without them the white background
     // would stretch to the full width of the status area instead of hugging
     // the square QR grid.
-    let width = columns as f32 * MODULE_SIZE_PX + PADDING_PX * 2.0;
-    let height = rows.len() as f32 * MODULE_SIZE_PX + PADDING_PX * 2.0;
+    let side = columns as f32 * MODULE_SIZE_PX + PADDING_PX * 2.0;
 
     div()
-        .w(px(width))
-        .h(px(height))
+        .w(px(side))
+        .h(px(side))
         .bg(rgb(0xFFFFFF))
         .p(px(PADDING_PX))
-        .child(v_flex().children(rows.into_iter().map(|row| {
-            h_flex().children(row.into_iter().map(|is_dark_module| {
-                div().size(px(MODULE_SIZE_PX)).bg(if is_dark_module {
-                    rgb(0x000000)
-                } else {
-                    rgb(0xFFFFFF)
-                })
+        .child(v_flex().children(modules.chunks(columns).map(|row| {
+            h_flex().children(row.iter().map(|module| {
+                div()
+                    .size(px(MODULE_SIZE_PX))
+                    .bg(if *module == Color::Dark {
+                        rgb(0x000000)
+                    } else {
+                        rgb(0xFFFFFF)
+                    })
             }))
         })))
         .into_any_element()
@@ -714,14 +736,20 @@ fn render_progress(stats: &DownloadStats) -> AnyElement {
     v_flex()
         .gap_2()
         .child(stats.status_message.clone())
-        .child(format!(
-            "Depot progress: {:.1}%",
-            stats.current_depot_percent
-        ))
+        .child(format!("Progress: {:.1}%", stats.percent_complete()))
         .child(format!(
             "Downloaded: {} of {}",
-            format_bytes(stats.downloaded_bytes),
-            format_bytes(stats.total_size_estimate_bytes)
+            format_bytes(stats.network_bytes),
+            format_bytes(stats.network_total_bytes())
+        ))
+        .child(format!(
+            "Written to disk: {} of {}",
+            format_bytes(stats.completed_uncompressed_bytes()),
+            format_bytes(stats.total_uncompressed_bytes)
+        ))
+        .child(format!(
+            "Files: {} of {}",
+            stats.files_done, stats.total_files
         ))
         .child(format!(
             "Download speed: {}",

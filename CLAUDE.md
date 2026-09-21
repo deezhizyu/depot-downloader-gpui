@@ -9,12 +9,12 @@ Steam-client download would look, styled to match Zed's own UI.
 
 - Username/password login and QR login (scan with the Steam Mobile app), both backed by
   DepotDownloader's own `-username`/`-password` and `-qr` flags.
-- A genuinely good parser of DepotDownloader's console output: total/known download size,
+- Exact progress numbers from our DepotDownloader fork's `-json` output: total/known download size,
   current downloaded size, an accurate time estimate, download speed, and disk write speed, all
   in MB/s.
-- For this first version, the only inputs are the Steam app id and the download location
-  (default: the detected Steam library's `steamapps/common` folder, or none to let
-  DepotDownloader use its own default). No branch/depot/platform/language selection yet.
+- For this first version, the inputs are the Steam app id, the library folder (default: the
+  detected Steam library's `steamapps/common` folder, or none to let DepotDownloader use its own
+  default), and an optional `-max-downloads` count (persisted; empty omits the flag). No branch/depot/platform/language selection yet.
 - Look and feel like Zed: dark, minimal, custom window chrome, matching color/typography tokens.
 
 ## Code style rules (apply to every change in this repo)
@@ -47,150 +47,77 @@ Steam-client download would look, styled to match Zed's own UI.
   selected. The UI reflects that: one form (app id, download location, login method/credentials)
   plus a status area that shows the QR code, a Steam Guard prompt, or live progress depending on
   what DepotDownloader's output says.
-- **DepotDownloader is provisioned automatically**: `depot_downloader::provisioning` downloads
-  the matching `DepotDownloader-{os}-{arch}.zip` from GitHub's `releases/latest/download/...`
-  permalink (no GitHub API call needed) the first time it's needed, extracts the executable, and
-  remembers its path in the config file so later launches skip the download.
-- **Parsing DepotDownloader's output** (`depot_downloader::parser`): DepotDownloader's own
-  overall-progress escape sequence (`ESC ]9;4;{state};{progress} BEL`) is only ever emitted when
-  stdout is a real terminal — `Console.IsOutputRedirected` disables it, and piping stdout (which
-  we must do, to parse it) always redirects it. So the primary, always-present live signal is the
-  per-file completion line (`"{percent}% {path}"`), which reports the *current depot's* running
-  percentage; DepotDownloader never prints an absolute byte total while downloading, only once a
-  depot (`"Depot N - Downloaded ..."`) or the whole run (`"Total downloaded: ..."`) finishes.
-  QR login is similar: DepotDownloader renders the QR code as ASCII/Unicode block art in the
-  terminal and never prints the underlying URL as text, so we capture that block verbatim. Both
-  the parser and the renderer deliberately avoid checking for the literal `'█'` (U+2588 FULL
-  BLOCK) glyph QRCoder uses for a dark module: on some platforms DepotDownloader's stdout for
-  that character does not survive as valid UTF-8 and decodes to the Unicode replacement character
-  instead, so the real byte identity of "dark" isn't predictable — only that light modules are
-  always plain spaces and dark modules are always some other single, consistent, non-space
-  character. `parser::is_qr_art_line` treats a line as QR art whenever it has at most one distinct
-  non-space character; `app::render_qr_code` treats a sampled module as dark whenever it's
-  non-whitespace at all. We also do not render the block as text: each QR module is drawn as two
-  identical characters, and that glyph isn't in IBM Plex Mono, so text rendering produced a blank
-  area even once the text itself was captured correctly. `render_qr_code` instead samples one
-  character per module (`step_by(2)`) and draws each module as an explicit black/white square
-  `div`, which is correct regardless of font or encoding and reads reliably by a phone camera.
-  Its container gets an explicit pixel width and height computed from the module grid, rather
-  than sizing to content, because it sits inside a `v_flex` that stretches children to fill its
-  cross axis - without that it would stretch to the status area's full width instead of staying
-  square. It then blocks silently waiting for the phone to confirm the scan, so no line ever
-  marks where the block ends either — `process::run`'s read loop races a short idle timer
-  (`QR_FLUSH_IDLE_TIMEOUT`) against new output and calls
-  `OutputParser::flush_pending_qr_block` once things go quiet, rather than waiting for a
-  terminator that will never come. That idle timer is a single absolute `Instant` deadline
-  carried across the whole loop and advanced only when a real output line arrives - never by a
-  disk-usage sample. It has to work this way: disk usage is polled unconditionally every
-  `DISK_POLL_INTERVAL` (500ms), faster than `QR_FLUSH_IDLE_TIMEOUT` (700ms), for as long as a
-  download directory is set (the common case), so a naively-recreated `Timer::after(...)` on
-  every loop iteration gets restarted by each disk sample before it can ever elapse - the QR
-  never idle-flushes at all, and in practice only ever appeared once some unrelated line (like
-  the next QR refresh's own heading) happened to end the block for a different reason.
+- **DepotDownloader is our own fork**: upstream prints no byte counters, so every number a
+  scraper could show would be an estimate. `github.com/deezhizyu/depot-downloader` (GPL-2.0, a fork
+  of SteamRE/DepotDownloader) adds a `-json` flag: stdout then carries only JSON Lines (schema in
+  the fork's `docs/json-mode.md`) with exact cumulative counters - `network_bytes` (compressed bytes
+  received), `written_bytes` (uncompressed bytes written), `verified_bytes` (already valid on disk,
+  so not re-downloaded) - plus a `plan` event with exact totals before any download starts, prompt
+  events, the raw QR challenge URL, `login_success` with the account name, and an `error` event.
+  `depot_downloader::provisioning` downloads the matching `DepotDownloader-{os}-{arch}.zip` from the
+  fork's `releases/latest/download/...` permalink (no GitHub API call) into
+  `depot-downloader-fork/` under the data dir the first time it is missing.
+- **Parsing is JSON, not text** (`depot_downloader::event`, serde): every line is an `EventLine`
+  (`t_ms` + a tagged `Event`); unknown events deserialize to `Event::Ignored`, and lines that are not
+  JSON (stderr traces) are dropped after being echoed to the console. `t_ms` is the fork's own
+  monotonic clock, so speeds are right even if this app reads a queued batch late.
+- **Progress numbers** (`depot_downloader::progress`): `ProgressTracker` copies the counters from
+  `progress`/`done` events into `DownloadStats` and keeps a short sliding window of samples; download
+  speed is `network_bytes` growth and disk speed is `written_bytes` growth over that window (1s), both
+  divided by elapsed `t_ms`. `process::run` also refreshes speeds every 100ms
+  (`SPEED_REFRESH_INTERVAL`) so they decay to zero when counters stop growing instead of freezing.
+  ETA is remaining uncompressed bytes (`total - written - verified`) over disk speed. "Downloaded"
+  shows `network_bytes` against `network_total_bytes()`: the plan's compressed total scaled by the
+  share of uncompressed bytes not already verified, which is exact on a clean download and the best
+  available figure on a resume. "Written to disk" is `written + verified` against the plan's
+  uncompressed total. The race in `process::next_sample` polls the refresh timer before the line
+  channel because `futures_lite::future::or` polls its first argument first, so a busy line channel
+  can never starve it.
+- **QR login**: the fork emits the challenge URL (on creation and every refresh); the GUI encodes it
+  with the `qrcode` crate and draws each module as an explicit black/white square `div` with an
+  explicit pixel width and height (it sits in a `v_flex`, which would otherwise stretch it).
+- **Prompts**: an `auth_prompt` (Steam Guard / email code / device confirmation) stays on
+  `DownloadStats` until any other event arrives - the fork is silent while a prompt is pending. A
+  `password` prompt during a `RememberedUsername` run means the saved login expired: the tracker
+  sets `login_expired`, `process::run` kills the child, and `RootView` forgets the username.
 - **Reading the child's stdout/stderr is byte-based, not `AsyncBufReadExt::lines()`**
   (`depot_downloader::process::forward_lines`): `lines()` silently ends its whole stream the
-  moment one line fails strict UTF-8 decoding, which would permanently kill that reader task
-  with no error logged — exactly the "output just stops forever, right in the middle of a QR
-  block" failure this app hit in practice. `forward_lines` instead reads with
-  `read_until(b'\n', ...)` and decodes each line with `String::from_utf8_lossy`, which never
-  fails, so one malformed line can never take the rest of the stream down with it.
-- **Progress numbers** (`depot_downloader::progress`): DepotDownloader never prints a running
-  byte counter, and polling the download directory's raw size on disk (`depot_downloader::process`'s
-  disk poller) can't stand in for one directly — DepotDownloader pre-allocates each file to its
-  full final size the moment it creates it, so the directory's size jumps to (near) the total
-  almost instantly, long before the data has actually arrived. What that polling *is* good for is
-  recovering the total size DepotDownloader itself never prints: `ProgressTracker` nets out
-  whatever was already in the directory before this run (`baseline_disk_bytes`, so a shared or
-  reused download folder's pre-existing content isn't mistaken for part of this download) to get
-  `total_size_estimate_bytes`, then multiplies that by the current depot's real completion
-  percentage (from CLI output) to get `downloaded_bytes`. Disk speed is the rate of change of that
-  estimate over a short sliding window. We always launch with `-debug`, which turns on
-  DepotDownloader's own "Downloading chunk ..." line for every chunk fetched over the network -
-  far more frequent than a per-file percent tick - so once at least one depot has finished (and we
-  therefore know its real compressed byte total), `download speed` is computed directly as
-  chunks-per-second × the learned average compressed bytes per chunk
-  (`ProgressTracker::record_chunk_download_started`/`average_compressed_chunk_bytes`), which is
-  both more accurate (a real observed chunk size, not a guessed constant) and far more responsive
-  than waiting on the next disk poll or percent line. Before any depot has finished, or once
-  `-debug` chunk events have aged out of the smoothing window, `download speed` falls back to
-  scaling disk speed by the compressed/uncompressed byte ratio learned from depots that have
-  already finished (1:1 until the first one completes, since that's the only place DepotDownloader
-  reports both figures). `-debug` also turns on an `EventListener` over several `System.Net.*`
-  sources (Http, Sockets, Security, NameResolution) and TPL, each producing a
-  `"{timestamp}  {source}.{event}(...)"` line per connection lifecycle step with no chunk identity
-  or byte count this app can use; `parser::dotnet_diagnostic_noise` recognizes and drops these
-  outright (no event, not even the `OtherOutput` fallback), and `process::run`'s loop skips
-  sending a UI update for any line that produced no event at all, so this firehose doesn't turn
-  into a Stats-resend-and-re-render storm on a fast connection. That same firehose also broke disk
-  polling outright at first: `process::run`'s loop used to pick its next sample by racing a
-  `next_line` future against a `next_disk_sample` future with `futures_lite::future::or`, which
-  always polls its first argument first and returns immediately if it's ready. Once `-debug` could
-  keep `line_rx` continuously non-empty, `next_disk_sample` stopped being polled at all for as long
-  as that backlog lasted — in practice, for the whole download — so `Downloaded`, `Download speed`,
-  and `Disk speed` froze at zero even while the percent-based fields kept updating normally. The fix
-  was to stop racing disk samples at all: `run`'s loop now drains `disk_rx` non-blockingly with
-  `try_recv` at the top of every iteration, unconditionally, before it does anything else, so no
-  amount of line volume can delay them. ETA is derived from the current
-  depot's percent-per-second rate directly, not
-  from a byte estimate, since a depot's total size is never printed while it's running. Both speed
-  figures only ever update on genuine growth (strictly more bytes than the oldest sample still in
-  the smoothing window, not merely as-many) — a large single file can go longer than the window
-  between DepotDownloader's own percent-line updates even while it keeps writing the whole time,
-  which ages every sample down to the same value; requiring real growth to update means that
-  case holds the last known speed instead of flashing to a wrong, literal 0 B/s until the next
-  update ticks. A Steam Guard prompt or QR code is cleared from `DownloadStats` as soon as any
-  further output arrives (`DownloadEvent::OtherOutput`, the fallback `parser::parse_plain_line`
-  produces for the many lines - license counts, depot key results, manifest details, and so on -
-  that don't map to any specific event), not only on a recognized depot-activity event: DepotDownloader
-  stays completely silent while a prompt is pending, so any line at all is proof it's done, and
-  waiting for a specific event left the prompt on screen through everything printed between a
-  successful login and the first depot actually starting.
+  moment one line fails strict UTF-8 decoding. `forward_lines` reads with `read_until(b'\n', ...)`
+  and decodes with `String::from_utf8_lossy`, which never fails.
 - **Remembering a login, and Logout** (`LoginMethod::RememberedUsername`): every launch passes
-  `-remember-password` unconditionally (verified safe for every login method - DepotDownloader
-  only rejects it when *both* `-username` and `-qr` are absent, which never happens here). After a
-  successful login (password or QR alike), DepotDownloader persists a login token itself, keyed by
-  account name, via .NET's per-user `IsolatedStorageFile` (not a path we control or need to). A
-  later run reconnects with just `-username {name} -remember-password` - no `-password`, no
-  `-qr` - which `RootView` builds once `Config.logged_in_username` is set. For a QR login we don't
-  know the account name up front, so `parser::PATTERNS.qr_login_remembered` captures it from
-  DepotDownloader's own `"Success! Next time you can login with -username {name} ..."` line
-  (`DownloadEvent::QrLoginRemembered`) into `DownloadStats::qr_resolved_username`; for
-  username/password login `RootView` already has it from the form. Either way, `app::apply_process_event`
-  only persists it to `Config` once a `Stats` update reaches `Running`/`Finished` - i.e. every
-  prompt/error slot on `stats` is empty - never merely on *attempting* login, since a bad password
-  or rejected QR scan never reaches that state and so can never poison the remembered account.
-  `Logout` clears `Config.logged_in_username` and best-effort deletes DepotDownloader's own
-  `account.config` file (`RootView::logout`) so a stale token can't linger even if reconstructed.
-- **`process::run`'s `Command` sets a fixed `current_dir`** (the DepotDownloader binary's own
-  install directory, from `provisioning::install_dir`): not for account.config (see above - that's
-  isolated storage, unaffected by working directory), but because DepotDownloader falls back to a
-  `"depots"` folder *relative to its own current working directory* whenever `-dir` is omitted, and
-  keeps its `.DepotDownloader` manifest/staging cache alongside whatever directory it downloaded
-  into. Without a fixed `current_dir`, both would depend on wherever the OS happened to launch the
-  GUI from, which is neither stable nor discoverable to the user.
-- **Pause / Resume / Cancel**: pausing stops the child process (`process::run` races a `cancel`
-  channel into its main select loop and calls `Child::kill()`) rather than truly suspending it -
-  there's no cross-platform suspend primitive available through `async-process`, and it isn't
-  needed: DepotDownloader already verifies existing files against the manifest on every run and
-  only re-fetches what's missing or invalid, so relaunching *is* a correct, fast continuation.
-  `RunState::Paused` is only reachable from `Running`, which (per the login-remembering bullet
-  above) guarantees a confirmed username already exists, so `resume_download` always reconnects
-  via `LoginMethod::RememberedUsername` regardless of whether the original login was password or
-  QR - no re-prompting, no re-scanning. Cancel reuses the exact same kill mechanism; the only
-  difference is what `app::apply_process_event` does with the resulting `ProcessEvent::Exited`
-  (tracked via `PendingControl`, set right before the signal is sent, so a user-requested stop is
-  never mistaken for DepotDownloader exiting unexpectedly on its own). Cancel is gated behind a
-  confirmation (`Window::open_alert_dialog`, gpui-kit's existing dialog component - not a bespoke
-  one) since it discards the running process outright, unlike Pause.
+  `-remember-password` unconditionally (DepotDownloader only rejects it when *both* `-username` and
+  `-qr` are absent, which never happens here). After a successful login DepotDownloader persists a
+  login token itself via .NET's per-user `IsolatedStorageFile`. A later run reconnects with just
+  `-username {name} -remember-password`. `Config.logged_in_username` is set from the
+  `login_success` event, which only fires on success, so a bad password or rejected QR scan can
+  never poison the remembered account. `Logout` clears it and best-effort deletes DepotDownloader's
+  own `account.config` (`RootView::logout`).
+- **`process::run`'s `Command` sets a fixed `current_dir`** (the binary's install directory, from
+  `provisioning::install_dir`): DepotDownloader falls back to a `"depots"` folder relative to its
+  working directory whenever `-dir` is omitted, and keeps its `.DepotDownloader` manifest/staging
+  cache alongside the download. Without a fixed `current_dir` both would depend on wherever the OS
+  launched the GUI from.
+- **Pause / Resume / Cancel**: pausing kills the child (`process::run` races a `cancel` channel into
+  its select loop) rather than suspending it - DepotDownloader verifies existing files against the
+  manifest on every run and only re-fetches what is missing, so relaunching *is* a correct
+  continuation, and `verified_bytes` accounts for what was already there. `RunState::Paused` is only
+  reachable from `Running`, which guarantees a confirmed username, so `resume_download` always
+  reconnects via `LoginMethod::RememberedUsername`. Cancel reuses the same kill; the difference is
+  what `app::apply_process_event` does with `ProcessEvent::Exited` (tracked via `PendingControl`).
+  Cancel is gated behind a confirmation (`Window::open_alert_dialog`).
+- **Install folder lookup** (`steam::fetch_install_dir_name`): the chosen location is a library
+  folder and the game lands in `{library}/{installdir}`. The fork only reports `installdir` after
+  launch but `-dir` must be chosen before, so one blocking call to
+  `api.steamcmd.net/v1/info/{app_id}` (10s timeout, `RunState::LookingUpApp`) supplies it, falling
+  back to the app id if the name is missing or not a single safe path component.
 - **Console logging**: `depot_downloader::process` and `provisioning` print `eprintln!` lines
-  (DepotDownloader's own stdout/stderr verbatim, plus the launch command with the password
-  redacted, exit status, and provisioning steps) so a stuck or confusing run can be diagnosed by
-  running the app from a terminal, without needing a dedicated logging crate.
-- **Process I/O**: `async-process` + `smol` (already in gpui's own dependency tree, so this adds
-  no new runtime) rather than `tokio`, since gpui's executor is smol-based.
-- **Config persistence**: the last app id, last download location, and the resolved
-  DepotDownloader binary path are saved as JSON under the OS config directory
-  (`directories::ProjectDirs`). Login credentials are never persisted.
+  (the fork's stdout/stderr verbatim, the launch command with the password redacted, exit status,
+  provisioning steps) so a stuck run can be diagnosed from a terminal.
+- **Process I/O**: `async-process` + `smol` (already in gpui's own dependency tree) rather than
+  `tokio`, since gpui's executor is smol-based.
+- **Config persistence**: the last app id, download location, max-downloads text and remembered
+  username are saved as JSON under the OS config directory (`directories::ProjectDirs`). Login
+  credentials are never persisted.
 
 ## Project layout
 
@@ -198,15 +125,16 @@ Steam-client download would look, styled to match Zed's own UI.
 src/
   main.rs                       Entry point: opens the window, installs the theme
   app.rs                        The single root view (form + status/progress area)
-  config.rs                     Persisted settings (app id, download location, binary path)
+  config.rs                     Persisted settings
   theme.rs                      Applies assets/theme/zed_one_dark.json to gpui-component
   steam/
     library_path.rs             Per-OS default Steam "steamapps/common" detection
+    app_info.rs                 App id -> `installdir` folder name (api.steamcmd.net)
   depot_downloader/
-    parser.rs                   DepotDownloader stdout/stderr line -> DownloadEvent
-    progress.rs                 DownloadEvent + disk samples -> DownloadStats (speeds, ETA)
+    event.rs                    Serde model of the fork's -json event lines
+    progress.rs                 Events -> DownloadStats (exact counters, windowed speeds, ETA)
     process.rs                  Spawns DepotDownloader, streams output, feeds stdin
-    provisioning.rs             Locates or downloads+extracts the DepotDownloader binary
+    provisioning.rs             Locates or downloads+extracts the fork's binary
   ui/
     format.rs                   Byte/speed/ETA formatting shared by the views
 assets/
