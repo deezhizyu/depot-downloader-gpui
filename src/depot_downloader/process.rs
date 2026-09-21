@@ -3,7 +3,6 @@ use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use async_process::{Command, Stdio};
-use futures_lite::StreamExt;
 use futures_lite::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use super::parser::OutputParser;
@@ -213,15 +212,34 @@ async fn next_sample(
     .await
 }
 
+/// Reads raw bytes and splits on `\n` ourselves, rather than using
+/// `AsyncBufReadExt::lines()`, because that adapter silently ends the whole
+/// stream the moment one line fails strict UTF-8 decoding - and DepotDownloader's
+/// QR code block is exactly the kind of output most likely to hit an encoding
+/// edge case on some platforms. `from_utf8_lossy` never fails, so one malformed
+/// line can never take down the rest of the read loop with it.
 async fn forward_lines(
     reader: impl futures_lite::AsyncRead + Unpin,
     sink: async_channel::Sender<String>,
 ) {
-    let mut lines = BufReader::new(reader).lines();
-    while let Some(Ok(line)) = lines.next().await {
-        eprintln!("[DepotDownloader] {line}");
-        if sink.send(line).await.is_err() {
-            break;
+    let mut reader = BufReader::new(reader);
+    let mut raw_line = Vec::new();
+    loop {
+        raw_line.clear();
+        match reader.read_until(b'\n', &mut raw_line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&raw_line);
+                let line = line.trim_end_matches(['\r', '\n']);
+                eprintln!("[DepotDownloader] {line}");
+                if sink.send(line.to_string()).await.is_err() {
+                    break;
+                }
+            }
+            Err(error) => {
+                eprintln!("[depot-downloader-gpui] error reading DepotDownloader output: {error}");
+                break;
+            }
         }
     }
 }
