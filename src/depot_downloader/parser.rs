@@ -90,7 +90,9 @@ static PATTERNS: LazyLock<Patterns> = LazyLock::new(|| Patterns {
 /// the QR login prompt spans multiple lines: everything after "Use the Steam
 /// Mobile App to sign in with this QR code:" up to the first line that isn't
 /// QR art is one ASCII-art block, and DepotDownloader never prints the login
-/// URL as text.
+/// URL as text. In practice DepotDownloader then blocks waiting for the scan
+/// and never prints a line to mark the block's end, so the caller must also
+/// call [`Self::flush_pending_qr_block`] after a short idle period.
 pub struct OutputParser {
     collecting_qr_lines: Option<Vec<String>>,
 }
@@ -138,6 +140,22 @@ impl OutputParser {
             events.push(event);
         }
         events
+    }
+
+    /// DepotDownloader prints the QR code and then, while it waits for the
+    /// phone to confirm the scan, goes silent - it never prints a further
+    /// line to signal that the block ended. The caller should invoke this
+    /// after a short period with no new output, to show the QR code even
+    /// though nothing marks its end textually. A no-op if no QR block is
+    /// currently being collected, or nothing has arrived for it yet.
+    pub fn flush_pending_qr_block(&mut self) -> Option<DownloadEvent> {
+        let qr_lines = self.collecting_qr_lines.as_ref()?;
+        if qr_lines.is_empty() {
+            return None;
+        }
+        let ascii_art = qr_lines.join("\n");
+        self.collecting_qr_lines = None;
+        Some(DownloadEvent::QrCodeReady { ascii_art })
     }
 }
 
@@ -283,6 +301,43 @@ mod tests {
                 DownloadEvent::ProcessingDepot { depot_id: 123 },
             ]
         );
+    }
+
+    #[test]
+    fn flushes_qr_block_when_depot_downloader_goes_silent() {
+        // DepotDownloader prints the QR then blocks waiting for the phone
+        // scan, so no line ever marks the block's end - only an explicit
+        // idle-flush (driven by a timer in the process supervisor) does.
+        let mut parser = OutputParser::new();
+        assert!(
+            parser
+                .feed("Use the Steam Mobile App to sign in with this QR code:")
+                .is_empty()
+        );
+        assert!(parser.feed("            ").is_empty());
+        assert!(parser.feed("█████████").is_empty());
+
+        assert_eq!(
+            parser.flush_pending_qr_block(),
+            Some(DownloadEvent::QrCodeReady {
+                ascii_art: "            \n█████████".into()
+            })
+        );
+        // Flushing is one-shot; nothing left to flush a second time.
+        assert_eq!(parser.flush_pending_qr_block(), None);
+    }
+
+    #[test]
+    fn does_not_flush_before_the_heading_or_before_any_line_arrives() {
+        let mut parser = OutputParser::new();
+        assert_eq!(parser.flush_pending_qr_block(), None);
+
+        assert!(
+            parser
+                .feed("Use the Steam Mobile App to sign in with this QR code:")
+                .is_empty()
+        );
+        assert_eq!(parser.flush_pending_qr_block(), None);
     }
 
     #[test]

@@ -60,7 +60,12 @@ Steam-client download would look, styled to match Zed's own UI.
   depot (`"Depot N - Downloaded ..."`) or the whole run (`"Total downloaded: ..."`) finishes.
   QR login is similar: DepotDownloader renders the QR code as ASCII/Unicode block art in the
   terminal and never prints the underlying URL as text, so we capture that block verbatim and
-  render it in a monospace font rather than trying to decode it back into a module grid.
+  render it in a monospace font rather than trying to decode it back into a module grid. It then
+  blocks silently waiting for the phone to confirm the scan, so no line ever marks where the
+  block ends either — `process::run`'s read loop races a short idle timer
+  (`QR_FLUSH_IDLE_TIMEOUT`) against new output and calls
+  `OutputParser::flush_pending_qr_block` once things go quiet, rather than waiting for a
+  terminator that will never come.
 - **Progress numbers** (`depot_downloader::progress`): DepotDownloader never prints a running
   byte counter, and polling the download directory's raw size on disk (`depot_downloader::process`'s
   disk poller) can't stand in for one directly — DepotDownloader pre-allocates each file to its

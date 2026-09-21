@@ -12,6 +12,12 @@ use super::progress::{DownloadStats, ProgressTracker};
 /// How often we re-measure the download directory's size on disk.
 const DISK_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How long to wait for more output before assuming a pending QR code block
+/// is complete. DepotDownloader prints the QR and then blocks silently
+/// waiting for the phone to confirm the scan, so nothing ever marks the
+/// block's end in the text itself.
+const QR_FLUSH_IDLE_TIMEOUT: Duration = Duration::from_millis(700);
+
 #[derive(Debug, Clone)]
 pub enum LoginMethod {
     UsernamePassword { username: String, password: String },
@@ -144,6 +150,12 @@ pub async fn run(
                 }
             }
             Sample::DiskBytes(bytes) => tracker.apply_disk_sample(bytes, Instant::now()),
+            Sample::Idle => {
+                if let Some(event) = parser.flush_pending_qr_block() {
+                    eprintln!("[depot-downloader-gpui] QR code ready (no further output arrived)");
+                    tracker.apply_event(event);
+                }
+            }
             Sample::LineChannelClosed => break,
         }
         if updates
@@ -163,6 +175,7 @@ pub async fn run(
 enum Sample {
     Line(String),
     DiskBytes(u64),
+    Idle,
     LineChannelClosed,
 }
 
@@ -186,7 +199,18 @@ async fn next_sample(
             Err(_) => std::future::pending::<Sample>().await,
         }
     };
-    futures_lite::future::or(next_line, next_disk_sample).await
+    // Recreated fresh on every call, so it naturally debounces: any line or
+    // disk sample arriving first cancels it, and it only ever fires after a
+    // real idle gap.
+    let idle_tick = async {
+        smol::Timer::after(QR_FLUSH_IDLE_TIMEOUT).await;
+        Sample::Idle
+    };
+    futures_lite::future::or(
+        futures_lite::future::or(next_line, next_disk_sample),
+        idle_tick,
+    )
+    .await
 }
 
 async fn forward_lines(
