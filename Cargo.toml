@@ -1,0 +1,29 @@
+[package]
+name = "depot-downloader-gpui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+async-channel = "2.5.0"
+async-process = "2.5.0"
+directories = "6.0.0"
+futures-lite = "2.6.1"
+gpui-kit = "0.6"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+smol = "2.0.2"
+ureq = "3.4.2"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+# gpui-component's debug-only inspector overlay (compiled whenever
+# debug_assertions is on, i.e. every `cargo check`/`cargo build`) does not
+# build against the gpui-pre patch release gpui-kit 0.6.4 pins
+# (register_inspector_element's signature changed between 0.3.5 and 0.3.6).
+# We don't use the inspector, so disable debug assertions for this one
+# dependency rather than pinning around an upstream version conflict.
+[profile.dev.package.gpui-component]
+debug-assertions = false
+
