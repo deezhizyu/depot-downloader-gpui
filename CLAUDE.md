@@ -66,6 +66,13 @@ Steam-client download would look, styled to match Zed's own UI.
   (`QR_FLUSH_IDLE_TIMEOUT`) against new output and calls
   `OutputParser::flush_pending_qr_block` once things go quiet, rather than waiting for a
   terminator that will never come.
+- **Reading the child's stdout/stderr is byte-based, not `AsyncBufReadExt::lines()`**
+  (`depot_downloader::process::forward_lines`): `lines()` silently ends its whole stream the
+  moment one line fails strict UTF-8 decoding, which would permanently kill that reader task
+  with no error logged — exactly the "output just stops forever, right in the middle of a QR
+  block" failure this app hit in practice. `forward_lines` instead reads with
+  `read_until(b'\n', ...)` and decodes each line with `String::from_utf8_lossy`, which never
+  fails, so one malformed line can never take the rest of the stream down with it.
 - **Progress numbers** (`depot_downloader::progress`): DepotDownloader never prints a running
   byte counter, and polling the download directory's raw size on disk (`depot_downloader::process`'s
   disk poller) can't stand in for one directly — DepotDownloader pre-allocates each file to its
