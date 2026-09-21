@@ -40,6 +40,8 @@ pub enum Event {
         written_bytes: u64,
         verified_bytes: u64,
         files_done: u64,
+        #[serde(default)]
+        current_file: Option<String>,
     },
     Done {
         network_bytes: u64,
@@ -83,7 +85,7 @@ mod tests {
     #[test]
     fn parses_progress_counters() {
         let line = parse(
-            r#"{"event":"progress","t_ms":1500,"network_bytes":10,"written_bytes":20,"verified_bytes":30,"files_done":4}"#,
+            r#"{"event":"progress","t_ms":1500,"network_bytes":10,"written_bytes":20,"verified_bytes":30,"files_done":4,"current_file":"Squad/a.pak"}"#,
         );
         assert_eq!(line.t_ms, 1500);
         assert!(matches!(
@@ -92,7 +94,8 @@ mod tests {
                 network_bytes: 10,
                 written_bytes: 20,
                 verified_bytes: 30,
-                files_done: 4
+                files_done: 4,
+                current_file: Some(_)
             }
         ));
     }

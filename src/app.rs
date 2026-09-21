@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::base::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::progress::Progress;
 use gpui_kit::component::{ActiveTheme, Root, TitleBar, WindowExt, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -88,7 +89,7 @@ impl RootView {
         });
         let app_id_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Steam app id, e.g. 440")
+                .placeholder("Steam app id or store URL")
                 .default_value(config.last_app_id.clone())
         });
 
@@ -110,6 +111,22 @@ impl RootView {
         });
         let guard_code_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Steam Guard code"));
+
+        cx.subscribe_in(
+            &app_id_input,
+            window,
+            |_view, input, event: &InputEvent, window, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                let current = input.read(cx).value().to_string();
+                let parsed = steam::parse_app_id(&current);
+                if parsed != current {
+                    input.update(cx, |state, cx| state.set_value(parsed, window, cx));
+                }
+            },
+        )
+        .detach();
 
         let view = Self {
             config,
@@ -159,7 +176,7 @@ impl RootView {
             return;
         };
 
-        let app_id = self.app_id_input.read(cx).value().trim().to_string();
+        let app_id = steam::parse_app_id(&self.app_id_input.read(cx).value());
         if app_id.is_empty() {
             self.run_state = RunState::Failed("Enter a Steam app id first.".to_string());
             cx.notify();
@@ -422,6 +439,16 @@ impl RootView {
         cx.notify();
     }
 
+    fn is_awaiting_download_start(&self) -> bool {
+        matches!(
+            self.run_state,
+            RunState::PreparingDepotDownloader
+                | RunState::Idle
+                | RunState::Finished(_)
+                | RunState::Failed(_)
+        )
+    }
+
     fn render_login_mode_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .gap_2()
@@ -530,7 +557,6 @@ impl RootView {
                 "Max concurrent downloads (optional)",
                 Input::new(&self.max_downloads_input),
             ))
-            .child(self.render_login_section(cx))
             .child(
                 Button::new("start-download")
                     .primary()
@@ -544,7 +570,7 @@ impl RootView {
         match &self.run_state {
             RunState::PreparingDepotDownloader => status_line("Setting up DepotDownloader…", cx),
             RunState::LookingUpApp => status_line("Looking up app…", cx),
-            RunState::Idle => div().into_any_element(),
+            RunState::Idle => status_line("Download progress appears here.", cx),
             RunState::ShowingQrCode { url } => v_flex()
                 .gap_2()
                 .child("Scan this with the Steam Mobile app:")
@@ -558,15 +584,15 @@ impl RootView {
             }
             RunState::Running(stats) => v_flex()
                 .gap_3()
-                .child(render_progress(stats))
+                .child(render_progress(stats, cx))
                 .child(self.render_running_controls(cx))
                 .into_any_element(),
             RunState::Paused(stats) => v_flex()
                 .gap_3()
-                .child(render_progress(stats))
+                .child(render_progress(stats, cx))
                 .child(self.render_paused_controls(cx))
                 .into_any_element(),
-            RunState::Finished(stats) => render_progress(stats),
+            RunState::Finished(stats) => render_progress(stats, cx),
             RunState::Failed(message) => div()
                 .text_color(cx.theme().colors.danger)
                 .child(message.clone())
@@ -667,13 +693,35 @@ impl Render for RootView {
             .bg(cx.theme().colors.background)
             .child(TitleBar::new().child("DepotDownloader"))
             .child(
-                v_flex()
+                h_flex()
                     .id("content")
                     .flex_1()
-                    .p_6()
-                    .gap_5()
-                    .child(self.render_form(cx))
-                    .child(self.render_status(cx)),
+                    .min_h_0()
+                    .items_start()
+                    .child(
+                        v_flex()
+                            .h_full()
+                            .w(px(400.0))
+                            .flex_none()
+                            .p_6()
+                            .border_r_1()
+                            .border_color(cx.theme().colors.border)
+                            .child(self.render_form(cx)),
+                    )
+                    .child(
+                        v_flex()
+                            .id("status")
+                            .h_full()
+                            .flex_1()
+                            .min_w_0()
+                            .p_6()
+                            .gap_5()
+                            .overflow_y_scroll()
+                            .when(self.is_awaiting_download_start(), |column| {
+                                column.child(self.render_login_section(cx))
+                            })
+                            .child(self.render_status(cx)),
+                    ),
             )
             // Without this layer `open_alert_dialog` (the Cancel confirmation)
             // registers its dialog but nothing ever draws it.
@@ -732,11 +780,27 @@ fn render_qr_code(url: &str) -> AnyElement {
         .into_any_element()
 }
 
-fn render_progress(stats: &DownloadStats) -> AnyElement {
+fn render_progress(stats: &DownloadStats, cx: &App) -> AnyElement {
     v_flex()
         .gap_2()
-        .child(stats.status_message.clone())
-        .child(format!("Progress: {:.1}%", stats.percent_complete()))
+        .child(
+            div()
+                .h(px(96.0))
+                .p_2()
+                .overflow_hidden()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().input)
+                .bg(cx.theme().input_background())
+                .child(stats.status_message.clone()),
+        )
+        .child(Progress::new("download-progress").value(stats.percent_complete() as f32))
+        .child(
+            h_flex()
+                .justify_between()
+                .child(format!("Progress: {:.1}%", stats.percent_complete()))
+                .child(format!("ETA: {}", format_eta(stats.eta))),
+        )
         .child(format!(
             "Downloaded: {} of {}",
             format_bytes(stats.network_bytes),
@@ -751,15 +815,18 @@ fn render_progress(stats: &DownloadStats) -> AnyElement {
             "Files: {} of {}",
             stats.files_done, stats.total_files
         ))
-        .child(format!(
-            "Download speed: {}",
-            format_speed(stats.download_speed_bytes_per_sec)
-        ))
-        .child(format!(
-            "Disk speed: {}",
-            format_speed(stats.disk_speed_bytes_per_sec)
-        ))
-        .child(format!("ETA: {}", format_eta(stats.eta)))
+        .child(
+            h_flex()
+                .justify_between()
+                .child(format!(
+                    "Download: {}",
+                    format_speed(stats.download_speed_bytes_per_sec)
+                ))
+                .child(format!(
+                    "Disk: {}",
+                    format_speed(stats.disk_speed_bytes_per_sec)
+                )),
+        )
         .into_any_element()
 }
 

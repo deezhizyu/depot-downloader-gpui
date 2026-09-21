@@ -63,7 +63,7 @@ Steam-client download would look, styled to match Zed's own UI.
   monotonic clock, so speeds are right even if this app reads a queued batch late.
 - **Progress numbers** (`depot_downloader::progress`): `ProgressTracker` copies the counters from
   `progress`/`done` events into `DownloadStats` and keeps a short sliding window of samples; download
-  speed is `network_bytes` growth and disk speed is `written_bytes` growth over that window (1s), both
+  speed is `network_bytes` growth and disk speed is growth of `written + verified` bytes (so the validation pass shows a rate) over that window (1s), both
   divided by elapsed `t_ms`. `process::run` also refreshes speeds every 100ms
   (`SPEED_REFRESH_INTERVAL`) so they decay to zero when counters stop growing instead of freezing.
   ETA is remaining uncompressed bytes (`total - written - verified`) over disk speed. "Downloaded"
@@ -129,6 +129,7 @@ src/
   theme.rs                      Applies assets/theme/zed_one_dark.json to gpui-component
   steam/
     library_path.rs             Per-OS default Steam "steamapps/common" detection
+    app_id.rs                   Steam app id from plain text or a store URL
     app_info.rs                 App id -> `installdir` folder name (api.steamcmd.net)
   depot_downloader/
     event.rs                    Serde model of the fork's -json event lines

@@ -5,6 +5,7 @@ use super::event::{AuthPromptKind, Event, EventLine, LogLevel};
 
 /// Speeds are the counter growth across this much of the most recent time.
 const SPEED_WINDOW_MS: u64 = 1000;
+const ETA_SMOOTHING_SECS: f64 = 10.0;
 
 #[derive(Debug, Clone)]
 pub struct AuthPrompt {
@@ -67,12 +68,15 @@ impl DownloadStats {
 struct CounterSample {
     t_ms: u64,
     network_bytes: u64,
-    written_bytes: u64,
+    completed_uncompressed_bytes: u64,
 }
 
 pub struct ProgressTracker {
     stats: DownloadStats,
     samples: VecDeque<CounterSample>,
+    downloading_message: String,
+    smoothed_disk_speed_bytes_per_sec: f64,
+    smoothed_at_ms: u64,
     latest_t_ms: u64,
     latest_received_at: Instant,
 }
@@ -82,6 +86,9 @@ impl ProgressTracker {
         Self {
             stats: DownloadStats::default(),
             samples: VecDeque::new(),
+            downloading_message: String::new(),
+            smoothed_disk_speed_bytes_per_sec: 0.0,
+            smoothed_at_ms: 0,
             latest_t_ms: 0,
             latest_received_at: Instant::now(),
         }
@@ -152,14 +159,27 @@ impl ProgressTracker {
                 self.stats.total_files = total_files;
             }
             Event::DepotStart { depot_id } => {
-                self.stats.status_message = format!("Downloading depot {depot_id}");
+                self.downloading_message = format!("Downloading depot {depot_id}");
+                self.stats.status_message = self.downloading_message.clone();
             }
             Event::Progress {
                 network_bytes,
                 written_bytes,
                 verified_bytes,
                 files_done,
+                current_file,
             } => {
+                // The fork stops logging once bytes flow, so without this the
+                // last log line would go stale.
+                if let Some(file) = current_file {
+                    if self.stats.status_message.strip_prefix("Downloading ") != Some(&file) {
+                        self.stats.status_message = format!("Downloading {file}");
+                    }
+                } else if network_bytes > self.stats.network_bytes
+                    && self.stats.status_message != self.downloading_message
+                {
+                    self.stats.status_message = self.downloading_message.clone();
+                }
                 self.record_counters(network_bytes, written_bytes, verified_bytes, t_ms);
                 self.stats.files_done = files_done;
             }
@@ -191,7 +211,7 @@ impl ProgressTracker {
         self.samples.push_back(CounterSample {
             t_ms,
             network_bytes,
-            written_bytes,
+            completed_uncompressed_bytes: self.stats.completed_uncompressed_bytes(),
         });
         self.update_speeds(t_ms);
     }
@@ -217,9 +237,26 @@ impl ProgressTracker {
         let elapsed_secs = elapsed_ms as f64 / 1000.0;
         self.stats.download_speed_bytes_per_sec =
             (self.stats.network_bytes - oldest.network_bytes) as f64 / elapsed_secs;
-        self.stats.disk_speed_bytes_per_sec =
-            (self.stats.written_bytes - oldest.written_bytes) as f64 / elapsed_secs;
+        self.stats.disk_speed_bytes_per_sec = (self.stats.completed_uncompressed_bytes()
+            - oldest.completed_uncompressed_bytes)
+            as f64
+            / elapsed_secs;
+        self.smooth_disk_speed(now_ms);
         self.stats.eta = self.estimate_remaining_time();
+    }
+
+    /// Exponential moving average of the disk speed, so the ETA does not
+    /// jump with every window's momentary rate.
+    fn smooth_disk_speed(&mut self, now_ms: u64) {
+        let elapsed_secs = now_ms.saturating_sub(self.smoothed_at_ms) as f64 / 1000.0;
+        self.smoothed_at_ms = now_ms;
+        if self.smoothed_disk_speed_bytes_per_sec == 0.0 {
+            self.smoothed_disk_speed_bytes_per_sec = self.stats.disk_speed_bytes_per_sec;
+            return;
+        }
+        let weight = 1.0 - (-elapsed_secs / ETA_SMOOTHING_SECS).exp();
+        self.smoothed_disk_speed_bytes_per_sec +=
+            weight * (self.stats.disk_speed_bytes_per_sec - self.smoothed_disk_speed_bytes_per_sec);
     }
 
     fn estimate_remaining_time(&self) -> Option<Duration> {
@@ -228,7 +265,7 @@ impl ProgressTracker {
             .total_uncompressed_bytes
             .saturating_sub(self.stats.completed_uncompressed_bytes());
         (self.stats.disk_speed_bytes_per_sec > 0.0).then(|| {
-            Duration::from_secs_f64(remaining_bytes as f64 / self.stats.disk_speed_bytes_per_sec)
+            Duration::from_secs_f64(remaining_bytes as f64 / self.smoothed_disk_speed_bytes_per_sec)
         })
     }
 }
@@ -247,6 +284,7 @@ mod tests {
             written_bytes: written,
             verified_bytes: verified,
             files_done: 0,
+            current_file: None,
         }
     }
 
