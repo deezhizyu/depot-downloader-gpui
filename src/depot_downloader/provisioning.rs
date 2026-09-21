@@ -31,9 +31,15 @@ pub fn ensure_binary() -> anyhow::Result<PathBuf> {
         "[depot-downloader-gpui] extracting {}",
         archive_path.display()
     );
-    extract_binary(&archive_path, &binary_path)?;
-    make_executable(&binary_path)?;
+    let partial_binary_path = binary_path.with_extension("part");
+    let extracted = extract_binary(&archive_path, &partial_binary_path)
+        .and_then(|()| make_executable(&partial_binary_path))
+        .and_then(|()| Ok(std::fs::rename(&partial_binary_path, &binary_path)?));
     let _ = std::fs::remove_file(&archive_path);
+    if let Err(error) = extracted {
+        let _ = std::fs::remove_file(&partial_binary_path);
+        return Err(error);
+    }
     eprintln!(
         "[depot-downloader-gpui] DepotDownloader ready at {}",
         binary_path.display()

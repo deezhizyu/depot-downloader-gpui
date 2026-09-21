@@ -264,9 +264,11 @@ impl ProgressTracker {
             .stats
             .total_uncompressed_bytes
             .saturating_sub(self.stats.completed_uncompressed_bytes());
-        (self.stats.disk_speed_bytes_per_sec > 0.0).then(|| {
-            Duration::from_secs_f64(remaining_bytes as f64 / self.smoothed_disk_speed_bytes_per_sec)
-        })
+        if self.stats.disk_speed_bytes_per_sec <= 0.0 {
+            return None;
+        }
+        Duration::try_from_secs_f64(remaining_bytes as f64 / self.smoothed_disk_speed_bytes_per_sec)
+            .ok()
     }
 }
 

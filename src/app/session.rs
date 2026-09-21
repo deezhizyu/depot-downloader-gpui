@@ -88,15 +88,21 @@ impl RootView {
         self.run_state = RunState::LookingUpApp;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let lookup_app_id = app_id.clone();
-            let install_dir_name = cx
-                .background_executor()
-                .spawn(async move { steam::fetch_install_dir_name(&lookup_app_id) })
-                .await;
+            let download_dir = match library_dir {
+                Some(dir) => {
+                    let lookup_app_id = app_id.clone();
+                    let install_dir_name = cx
+                        .background_executor()
+                        .spawn(async move { steam::fetch_install_dir_name(&lookup_app_id) })
+                        .await;
+                    Some(dir.join(install_dir_name))
+                }
+                None => None,
+            };
             let request = DownloadRequest {
                 depot_downloader_binary: binary,
                 app_id,
-                download_dir: library_dir.map(|dir| dir.join(install_dir_name)),
+                download_dir,
                 max_downloads,
                 login,
             };

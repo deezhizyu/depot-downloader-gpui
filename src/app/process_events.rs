@@ -17,15 +17,18 @@ impl RootView {
                 Some(super::PendingControl::Cancelling) => {
                     self.run_state = super::RunState::Idle;
                 }
-                None => {
-                    if let super::RunState::Running(stats) = &self.run_state {
-                        self.run_state = if stats.is_finished {
-                            super::RunState::Finished(stats.clone())
-                        } else {
-                            super::RunState::Failed(describe_unexpected_exit(status))
-                        };
+                None => match &self.run_state {
+                    super::RunState::Running(stats) if stats.is_finished => {
+                        self.run_state = super::RunState::Finished(stats.clone());
                     }
-                }
+                    super::RunState::Running(_)
+                    | super::RunState::ShowingQrCode { .. }
+                    | super::RunState::AwaitingSteamGuardCode { .. }
+                    | super::RunState::AwaitingSteamGuardConfirmation => {
+                        self.run_state = super::RunState::Failed(describe_unexpected_exit(status));
+                    }
+                    _ => {}
+                },
             },
             ProcessEvent::Stats(stats) => {
                 // Only a successful login reports a username, so a bad
@@ -42,7 +45,9 @@ impl RootView {
                     self.config.save();
                 }
 
-                self.run_state = if let Some(url) = stats.qr_url {
+                self.run_state = if let Some(message) = stats.error_message {
+                    super::RunState::Failed(message)
+                } else if let Some(url) = stats.qr_url {
                     super::RunState::ShowingQrCode { url }
                 } else if let Some(prompt) = stats.auth_prompt {
                     match prompt.kind {
@@ -53,8 +58,6 @@ impl RootView {
                             message: prompt.message,
                         },
                     }
-                } else if let Some(message) = stats.error_message {
-                    super::RunState::Failed(message)
                 } else if stats.is_finished {
                     super::RunState::Finished(stats)
                 } else {

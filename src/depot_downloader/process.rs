@@ -133,7 +133,8 @@ pub async fn run(
         .args(request.build_args())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     // The remembered-login token itself (account.config) is unaffected by
     // this - DepotDownloader stores it via .NET's per-user IsolatedStorage,
     // keyed by the assembly, not by any real filesystem path. But without
