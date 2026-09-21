@@ -145,6 +145,43 @@ Steam-client download would look, styled to match Zed's own UI.
   stays completely silent while a prompt is pending, so any line at all is proof it's done, and
   waiting for a specific event left the prompt on screen through everything printed between a
   successful login and the first depot actually starting.
+- **Remembering a login, and Logout** (`LoginMethod::RememberedUsername`): every launch passes
+  `-remember-password` unconditionally (verified safe for every login method - DepotDownloader
+  only rejects it when *both* `-username` and `-qr` are absent, which never happens here). After a
+  successful login (password or QR alike), DepotDownloader persists a login token itself, keyed by
+  account name, via .NET's per-user `IsolatedStorageFile` (not a path we control or need to). A
+  later run reconnects with just `-username {name} -remember-password` - no `-password`, no
+  `-qr` - which `RootView` builds once `Config.logged_in_username` is set. For a QR login we don't
+  know the account name up front, so `parser::PATTERNS.qr_login_remembered` captures it from
+  DepotDownloader's own `"Success! Next time you can login with -username {name} ..."` line
+  (`DownloadEvent::QrLoginRemembered`) into `DownloadStats::qr_resolved_username`; for
+  username/password login `RootView` already has it from the form. Either way, `app::apply_process_event`
+  only persists it to `Config` once a `Stats` update reaches `Running`/`Finished` - i.e. every
+  prompt/error slot on `stats` is empty - never merely on *attempting* login, since a bad password
+  or rejected QR scan never reaches that state and so can never poison the remembered account.
+  `Logout` clears `Config.logged_in_username` and best-effort deletes DepotDownloader's own
+  `account.config` file (`RootView::logout`) so a stale token can't linger even if reconstructed.
+- **`process::run`'s `Command` sets a fixed `current_dir`** (the DepotDownloader binary's own
+  install directory, from `provisioning::install_dir`): not for account.config (see above - that's
+  isolated storage, unaffected by working directory), but because DepotDownloader falls back to a
+  `"depots"` folder *relative to its own current working directory* whenever `-dir` is omitted, and
+  keeps its `.DepotDownloader` manifest/staging cache alongside whatever directory it downloaded
+  into. Without a fixed `current_dir`, both would depend on wherever the OS happened to launch the
+  GUI from, which is neither stable nor discoverable to the user.
+- **Pause / Resume / Cancel**: pausing stops the child process (`process::run` races a `cancel`
+  channel into its main select loop and calls `Child::kill()`) rather than truly suspending it -
+  there's no cross-platform suspend primitive available through `async-process`, and it isn't
+  needed: DepotDownloader already verifies existing files against the manifest on every run and
+  only re-fetches what's missing or invalid, so relaunching *is* a correct, fast continuation.
+  `RunState::Paused` is only reachable from `Running`, which (per the login-remembering bullet
+  above) guarantees a confirmed username already exists, so `resume_download` always reconnects
+  via `LoginMethod::RememberedUsername` regardless of whether the original login was password or
+  QR - no re-prompting, no re-scanning. Cancel reuses the exact same kill mechanism; the only
+  difference is what `app::apply_process_event` does with the resulting `ProcessEvent::Exited`
+  (tracked via `PendingControl`, set right before the signal is sent, so a user-requested stop is
+  never mistaken for DepotDownloader exiting unexpectedly on its own). Cancel is gated behind a
+  confirmation (`Window::open_alert_dialog`, gpui-kit's existing dialog component - not a bespoke
+  one) since it discards the running process outright, unlike Pause.
 - **Console logging**: `depot_downloader::process` and `provisioning` print `eprintln!` lines
   (DepotDownloader's own stdout/stderr verbatim, plus the launch command with the password
   redacted, exit status, and provisioning steps) so a stuck or confusing run can be diagnosed by

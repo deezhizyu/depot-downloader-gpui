@@ -19,8 +19,17 @@ const QR_FLUSH_IDLE_TIMEOUT: Duration = Duration::from_millis(700);
 
 #[derive(Debug, Clone)]
 pub enum LoginMethod {
-    UsernamePassword { username: String, password: String },
+    UsernamePassword {
+        username: String,
+        password: String,
+    },
     Qr,
+    /// Reconnects with a previously remembered login (see the
+    /// `-remember-password`/`account.config` mechanism documented in
+    /// CLAUDE.md) - no password or QR scan needed, just the account name.
+    RememberedUsername {
+        username: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -36,10 +45,16 @@ impl DownloadRequest {
         // -debug enables per-chunk "Downloading chunk ..." lines, the
         // finest-grained progress signal DepotDownloader offers - see
         // ProgressTracker::record_chunk_download_started for what it buys us.
+        // -remember-password is unconditional: it's what makes DepotDownloader
+        // persist a login token to account.config after any successful login
+        // (password or QR alike), which is what LoginMethod::RememberedUsername
+        // relies on for later runs. Passing it is only ever an error when
+        // there's no -username and no -qr, which never happens here.
         let mut args = vec![
             "-app".to_string(),
             self.app_id.clone(),
             "-debug".to_string(),
+            "-remember-password".to_string(),
         ];
         if let Some(dir) = &self.download_dir {
             args.push("-dir".to_string());
@@ -53,6 +68,10 @@ impl DownloadRequest {
                 args.push(password.clone());
             }
             LoginMethod::Qr => args.push("-qr".to_string()),
+            LoginMethod::RememberedUsername { username } => {
+                args.push("-username".to_string());
+                args.push(username.clone());
+            }
         }
         args
     }
@@ -70,6 +89,11 @@ impl DownloadRequest {
     }
 }
 
+// `DownloadStats` naturally accumulates fields as this app's data model
+// grows, and a `Stats` event is only ever sent a few times a second over an
+// async channel - not a hot path where boxing it to shrink this enum would
+// buy anything real.
+#[allow(clippy::large_enum_variant)]
 pub enum ProcessEvent {
     Stats(DownloadStats),
     Exited(std::io::Result<ExitStatus>),
@@ -77,13 +101,17 @@ pub enum ProcessEvent {
 }
 
 /// Runs a DepotDownloader download to completion, sending a fresh
-/// [`DownloadStats`] snapshot on `updates` after every meaningful change and
+/// [`DownloadStats`] snapshot on `updates` after every meaningful change,
 /// forwarding lines from `respond` (e.g. a typed Steam Guard code) to the
-/// child's stdin. Intended to be driven from `cx.background_executor()`.
+/// child's stdin, and killing the child as soon as anything arrives on
+/// `cancel` (used for both pausing and cancelling - see `app::RootView`,
+/// which decides what a resulting early exit means). Intended to be driven
+/// from `cx.background_executor()`.
 pub async fn run(
     request: DownloadRequest,
     updates: async_channel::Sender<ProcessEvent>,
     respond: async_channel::Receiver<String>,
+    cancel: async_channel::Receiver<()>,
 ) {
     if let Some(dir) = &request.download_dir
         && let Err(error) = std::fs::create_dir_all(dir)
@@ -102,13 +130,28 @@ pub async fn run(
         request.build_args_for_logging().join(" ")
     );
 
-    let mut child = match Command::new(&request.depot_downloader_binary)
+    let mut command = Command::new(&request.depot_downloader_binary);
+    command
         .args(request.build_args())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    // The remembered-login token itself (account.config) is unaffected by
+    // this - DepotDownloader stores it via .NET's per-user IsolatedStorage,
+    // keyed by the assembly, not by any real filesystem path. But without
+    // `-dir`, DepotDownloader falls back to a "depots" folder relative to
+    // its own current working directory - which defaults to whatever
+    // directory the GUI happened to be launched from otherwise, and it also
+    // keeps its ".DepotDownloader" manifest/staging cache alongside that
+    // same install directory. Pinning it to the binary's own install
+    // directory (already a stable, writable location - see
+    // `provisioning::install_dir`) keeps both predictable regardless of how
+    // the user starts the app.
+    if let Some(install_dir) = request.depot_downloader_binary.parent() {
+        command.current_dir(install_dir);
+    }
+
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             eprintln!("[depot-downloader-gpui] failed to launch DepotDownloader: {error}");
@@ -162,7 +205,14 @@ pub async fn run(
             stats_changed = true;
         }
 
-        match next_sample(&line_rx, qr_idle_deadline).await {
+        match next_sample(&line_rx, &cancel, qr_idle_deadline).await {
+            Sample::CancelRequested => {
+                eprintln!(
+                    "[depot-downloader-gpui] stopping DepotDownloader (pause/cancel requested)"
+                );
+                let _ = child.kill();
+                break;
+            }
             Sample::Line(line) => {
                 qr_idle_deadline = Instant::now() + QR_FLUSH_IDLE_TIMEOUT;
                 let events = parser.feed(&line);
@@ -205,6 +255,7 @@ enum Sample {
     Line(String),
     Idle,
     LineChannelClosed,
+    CancelRequested,
 }
 
 /// Disk samples are deliberately not one of this function's arms - they're
@@ -230,8 +281,15 @@ enum Sample {
 /// `qr_idle_deadline` has passed, that guarantees it wins even in the instant
 /// a line also happens to be ready, since `or` favors whichever argument it
 /// polls first.
+///
+/// `cancel_rx` is also raced in here, rather than only drained at the top of
+/// the loop the way disk samples are: a user-initiated pause/cancel click is
+/// never frequent enough to risk the starvation class of bug fixed for disk
+/// polling, and racing it keeps reaction time near-instant even in the
+/// middle of a long QR wait.
 async fn next_sample(
     line_rx: &async_channel::Receiver<String>,
+    cancel_rx: &async_channel::Receiver<()>,
     qr_idle_deadline: Instant,
 ) -> Sample {
     let next_line = async {
@@ -244,7 +302,11 @@ async fn next_sample(
         smol::Timer::at(qr_idle_deadline).await;
         Sample::Idle
     };
-    futures_lite::future::or(idle_tick, next_line).await
+    let cancel_tick = async {
+        let _ = cancel_rx.recv().await;
+        Sample::CancelRequested
+    };
+    futures_lite::future::or(cancel_tick, futures_lite::future::or(idle_tick, next_line)).await
 }
 
 /// Reads raw bytes and splits on `\n` ourselves, rather than using
