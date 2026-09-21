@@ -76,8 +76,8 @@ fn binary_file_name() -> &'static str {
 fn download_release_asset(destination: &Path) -> anyhow::Result<()> {
     let url = format!("{RELEASE_BASE_URL}/{}", asset_file_name());
     let mut response = ureq::get(&url).call()?;
-    let bytes = response.body_mut().read_to_vec()?;
-    std::fs::write(destination, bytes)?;
+    let mut file = std::fs::File::create(destination)?;
+    std::io::copy(&mut response.body_mut().as_reader(), &mut file)?;
     Ok(())
 }
 

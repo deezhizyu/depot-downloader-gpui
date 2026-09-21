@@ -6,7 +6,7 @@ mod theme;
 mod ui;
 
 use gpui_kit::assets::Assets;
-use gpui_kit::component::Root;
+use gpui_kit::component::{Root, TitleBar};
 use gpui_kit::*;
 
 fn main() {
@@ -17,7 +17,7 @@ fn main() {
 
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(960.0), px(680.0)), cx)),
-            ..Default::default()
+            ..TitleBar::window_options()
         };
 
         cx.spawn(async move |cx| {
