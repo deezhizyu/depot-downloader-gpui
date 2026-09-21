@@ -88,8 +88,9 @@ static PATTERNS: LazyLock<Patterns> = LazyLock::new(|| Patterns {
 ///
 /// Kept as a small stateful struct (rather than a free function) only because
 /// the QR login prompt spans multiple lines: everything after "Use the Steam
-/// Mobile App to sign in with this QR code:" up to the next blank line is one
-/// ASCII-art block, and DepotDownloader never prints the login URL as text.
+/// Mobile App to sign in with this QR code:" up to the first line that isn't
+/// QR art is one ASCII-art block, and DepotDownloader never prints the login
+/// URL as text.
 pub struct OutputParser {
     collecting_qr_lines: Option<Vec<String>>,
 }
@@ -103,13 +104,15 @@ impl OutputParser {
 
     pub fn feed(&mut self, line: &str) -> Vec<DownloadEvent> {
         if let Some(qr_lines) = &mut self.collecting_qr_lines {
-            if line.trim().is_empty() {
-                let ascii_art = qr_lines.join("\n");
-                self.collecting_qr_lines = None;
-                return vec![DownloadEvent::QrCodeReady { ascii_art }];
+            if is_qr_art_line(line) {
+                qr_lines.push(line.to_string());
+                return Vec::new();
             }
-            qr_lines.push(line.to_string());
-            return Vec::new();
+            let ascii_art = qr_lines.join("\n");
+            self.collecting_qr_lines = None;
+            let mut events = vec![DownloadEvent::QrCodeReady { ascii_art }];
+            events.extend(self.feed(line));
+            return events;
         }
 
         if line.contains("Use the Steam Mobile App to sign in with this QR code:") {
@@ -136,6 +139,14 @@ impl OutputParser {
         }
         events
     }
+}
+
+/// QRCoder (which DepotDownloader uses to draw the QR code) renders dark
+/// modules as `'█'` and light modules as spaces, including whole quiet-zone
+/// rows that are nothing but spaces - so "blank" is not a valid end-of-block
+/// signal. Only a line with real text (an actual log line) ends the block.
+fn is_qr_art_line(line: &str) -> bool {
+    line.chars().all(|c| c == '█' || c == ' ')
 }
 
 fn parse_plain_line(line: &str) -> Option<DownloadEvent> {
@@ -249,21 +260,28 @@ mod tests {
     }
 
     #[test]
-    fn collects_multi_line_qr_code_block() {
+    fn collects_multi_line_qr_code_block_despite_blank_quiet_zone_rows() {
         let mut parser = OutputParser::new();
         assert!(
             parser
                 .feed("Use the Steam Mobile App to sign in with this QR code:")
                 .is_empty()
         );
+        // The QR's top quiet zone is a row made entirely of the whitespace
+        // module string - this must not be mistaken for the end of the block.
+        assert!(parser.feed("            ").is_empty());
         assert!(parser.feed("█████████").is_empty());
         assert!(parser.feed("██   █   ██").is_empty());
-        let events = parser.feed("");
+        // The first line with real text ends the block and is itself parsed.
+        let events = parser.feed("Processing depot 123");
         assert_eq!(
             events,
-            vec![DownloadEvent::QrCodeReady {
-                ascii_art: "█████████\n██   █   ██".into()
-            }]
+            vec![
+                DownloadEvent::QrCodeReady {
+                    ascii_art: "            \n█████████\n██   █   ██".into()
+                },
+                DownloadEvent::ProcessingDepot { depot_id: 123 },
+            ]
         );
     }
 
