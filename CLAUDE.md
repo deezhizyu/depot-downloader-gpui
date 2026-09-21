@@ -59,13 +59,20 @@ Steam-client download would look, styled to match Zed's own UI.
   percentage; DepotDownloader never prints an absolute byte total while downloading, only once a
   depot (`"Depot N - Downloaded ..."`) or the whole run (`"Total downloaded: ..."`) finishes.
   QR login is similar: DepotDownloader renders the QR code as ASCII/Unicode block art in the
-  terminal and never prints the underlying URL as text, so we capture that block verbatim. We do
-  not render it as text, though: each QR module is drawn as two `'█'` (U+2588 FULL BLOCK)
-  characters or two spaces, and that glyph isn't in IBM Plex Mono, so text rendering produced a
-  blank area even once the text itself was captured correctly. `app::render_qr_code` instead
-  samples one character per module (`step_by(2)`) and draws each module as an explicit
-  black/white square `div`, which is correct regardless of font and reads reliably by a phone
-  camera. It then blocks silently waiting for the phone to confirm the scan, so no line ever
+  terminal and never prints the underlying URL as text, so we capture that block verbatim. Both
+  the parser and the renderer deliberately avoid checking for the literal `'█'` (U+2588 FULL
+  BLOCK) glyph QRCoder uses for a dark module: on some platforms DepotDownloader's stdout for
+  that character does not survive as valid UTF-8 and decodes to the Unicode replacement character
+  instead, so the real byte identity of "dark" isn't predictable — only that light modules are
+  always plain spaces and dark modules are always some other single, consistent, non-space
+  character. `parser::is_qr_art_line` treats a line as QR art whenever it has at most one distinct
+  non-space character; `app::render_qr_code` treats a sampled module as dark whenever it's
+  non-whitespace at all. We also do not render the block as text: each QR module is drawn as two
+  identical characters, and that glyph isn't in IBM Plex Mono, so text rendering produced a blank
+  area even once the text itself was captured correctly. `render_qr_code` instead samples one
+  character per module (`step_by(2)`) and draws each module as an explicit black/white square
+  `div`, which is correct regardless of font or encoding and reads reliably by a phone camera. It
+  then blocks silently waiting for the phone to confirm the scan, so no line ever
   marks where the block ends either — `process::run`'s read loop races a short idle timer
   (`QR_FLUSH_IDLE_TIMEOUT`) against new output and calls
   `OutputParser::flush_pending_qr_block` once things go quiet, rather than waiting for a

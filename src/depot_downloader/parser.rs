@@ -159,12 +159,23 @@ impl OutputParser {
     }
 }
 
-/// QRCoder (which DepotDownloader uses to draw the QR code) renders dark
-/// modules as `'█'` and light modules as spaces, including whole quiet-zone
-/// rows that are nothing but spaces - so "blank" is not a valid end-of-block
-/// signal. Only a line with real text (an actual log line) ends the block.
+/// QRCoder (which DepotDownloader uses to draw the QR code) renders every
+/// dark module as the same repeated character and every light module as a
+/// space, including whole quiet-zone rows that are nothing but spaces - so
+/// "blank" is not a valid end-of-block signal. This deliberately does not
+/// check for the literal `'█'` glyph: on some platforms DepotDownloader's
+/// stdout for that character does not arrive as valid UTF-8 (observed as the
+/// Unicode replacement character once decoded), so what a real QR row's dark
+/// module decodes to isn't always predictable - only that it stays one single
+/// consistent character throughout the row. A line with more than one
+/// distinct non-space character is real text (an actual log line), which
+/// ends the block.
 fn is_qr_art_line(line: &str) -> bool {
-    line.chars().all(|c| c == '█' || c == ' ')
+    line.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        <= 1
 }
 
 fn parse_plain_line(line: &str) -> Option<DownloadEvent> {
@@ -297,6 +308,35 @@ mod tests {
             vec![
                 DownloadEvent::QrCodeReady {
                     ascii_art: "            \n█████████\n██   █   ██".into()
+                },
+                DownloadEvent::ProcessingDepot { depot_id: 123 },
+            ]
+        );
+    }
+
+    #[test]
+    fn collects_qr_code_block_whose_dark_module_is_not_the_expected_glyph() {
+        // On some platforms DepotDownloader's dark-module character does not
+        // survive as valid UTF-8 and decodes to the replacement character
+        // instead of '█' - the block must still be recognized as QR art
+        // rather than mistaken for a real log line ending it early.
+        let mut parser = OutputParser::new();
+        assert!(
+            parser
+                .feed("Use the Steam Mobile App to sign in with this QR code:")
+                .is_empty()
+        );
+        assert!(
+            parser
+                .feed("\u{FFFD}\u{FFFD}   \u{FFFD}\u{FFFD}")
+                .is_empty()
+        );
+        let events = parser.feed("Processing depot 123");
+        assert_eq!(
+            events,
+            vec![
+                DownloadEvent::QrCodeReady {
+                    ascii_art: "\u{FFFD}\u{FFFD}   \u{FFFD}\u{FFFD}".into()
                 },
                 DownloadEvent::ProcessingDepot { depot_id: 123 },
             ]

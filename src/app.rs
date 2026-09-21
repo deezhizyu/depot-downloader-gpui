@@ -416,6 +416,13 @@ fn status_line(message: &str, cx: &mut Context<RootView>) -> AnyElement {
 /// IBM Plex Mono does not - so instead this samples one character per module
 /// (`step_by(2)`) and draws each module as an explicit black/white square,
 /// which is correct regardless of font and reads reliably by a phone camera.
+///
+/// A module is "dark" whenever its sampled character isn't whitespace,
+/// rather than checking for the literal `'█'` glyph: on some platforms that
+/// character doesn't survive DepotDownloader's stdout as valid UTF-8 (it can
+/// decode to the Unicode replacement character instead), but light modules
+/// are always plain spaces either way, so whitespace-or-not is what actually
+/// distinguishes the two regardless of encoding.
 fn render_qr_code(ascii_art: &str) -> AnyElement {
     const MODULE_SIZE: Pixels = px(6.0);
 
@@ -424,7 +431,7 @@ fn render_qr_code(ascii_art: &str) -> AnyElement {
         .map(|line| {
             line.chars()
                 .step_by(2)
-                .map(|glyph| glyph == '█')
+                .map(|glyph| !glyph.is_whitespace())
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
