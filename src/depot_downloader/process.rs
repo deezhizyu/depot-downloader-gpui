@@ -139,7 +139,6 @@ pub async fn run(
     })
     .detach();
 
-    let has_disk_dir = request.download_dir.is_some();
     let (disk_tx, disk_rx) = async_channel::unbounded::<u64>();
     if let Some(dir) = request.download_dir.clone() {
         smol::spawn(poll_disk_usage(dir, disk_tx)).detach();
@@ -152,35 +151,46 @@ pub async fn run(
     let mut qr_idle_deadline = Instant::now() + QR_FLUSH_IDLE_TIMEOUT;
 
     loop {
-        match next_sample(&line_rx, &disk_rx, has_disk_dir, qr_idle_deadline).await {
+        // Drained unconditionally, before racing anything else in
+        // `next_sample`, so a burst of `-debug` diagnostic noise on
+        // `line_rx` (see `next_sample`'s doc comment) can never starve disk
+        // polling the way it could when a disk sample was just another arm
+        // of that race.
+        let mut stats_changed = false;
+        while let Ok(bytes) = disk_rx.try_recv() {
+            tracker.apply_disk_sample(bytes, Instant::now());
+            stats_changed = true;
+        }
+
+        match next_sample(&line_rx, qr_idle_deadline).await {
             Sample::Line(line) => {
                 qr_idle_deadline = Instant::now() + QR_FLUSH_IDLE_TIMEOUT;
                 let events = parser.feed(&line);
                 // `-debug` also enables .NET's HttpClient diagnostics, which
                 // produce no event at all (see `parser::dotnet_diagnostic_noise`).
-                // Skipping the UI update for those keeps a fast download from
+                // Not treating those as a change keeps a fast download from
                 // triggering a Stats resend + re-render on every single one.
-                if events.is_empty() {
-                    continue;
-                }
+                stats_changed |= !events.is_empty();
                 for event in events {
                     tracker.apply_event(event);
                 }
             }
-            Sample::DiskBytes(bytes) => tracker.apply_disk_sample(bytes, Instant::now()),
             Sample::Idle => {
                 qr_idle_deadline = Instant::now() + QR_FLUSH_IDLE_TIMEOUT;
                 if let Some(event) = parser.flush_pending_qr_block() {
                     eprintln!("[depot-downloader-gpui] QR code ready (no further output arrived)");
                     tracker.apply_event(event);
+                    stats_changed = true;
                 }
             }
             Sample::LineChannelClosed => break,
         }
-        if updates
-            .send(ProcessEvent::Stats(tracker.stats().clone()))
-            .await
-            .is_err()
+
+        if stats_changed
+            && updates
+                .send(ProcessEvent::Stats(tracker.stats().clone()))
+                .await
+                .is_err()
         {
             return;
         }
@@ -193,17 +203,24 @@ pub async fn run(
 
 enum Sample {
     Line(String),
-    DiskBytes(u64),
     Idle,
     LineChannelClosed,
 }
 
+/// Disk samples are deliberately not one of this function's arms - they're
+/// drained separately, non-blockingly, at the top of every iteration of
+/// `run`'s loop, specifically so line volume can never delay or starve them.
+/// An earlier version raced a `next_disk_sample` future here alongside
+/// `next_line`, but `futures_lite::future::or` always polls its first
+/// argument first and returns immediately if it's ready: once `-debug` was
+/// added and its diagnostic output could keep `line_rx` continuously
+/// non-empty, `next_disk_sample` stopped being polled at all for as long as
+/// that backlog lasted, and `Downloaded`/`Download speed`/`Disk speed`
+/// froze at zero for the whole run.
+///
 /// `qr_idle_deadline` is an absolute point in time, carried across every call
 /// from `run`'s loop and advanced only when a `Sample::Line` is actually
-/// processed - never when a disk sample is. That distinction is load-bearing:
-/// disk usage is polled unconditionally every `DISK_POLL_INTERVAL` (500ms),
-/// faster than `QR_FLUSH_IDLE_TIMEOUT` (700ms), for as long as a download
-/// directory is set (the common case). An earlier version built a fresh
+/// processed - never by a disk sample. An earlier version built a fresh
 /// `Timer::after(QR_FLUSH_IDLE_TIMEOUT)` on every call instead, so each disk
 /// sample - not real DepotDownloader output - restarted its 700ms window
 /// before it could ever elapse, starving the QR flush indefinitely: the QR
@@ -211,12 +228,10 @@ enum Sample {
 /// refresh's own heading) happened to end the block for an unrelated reason.
 /// Racing the idle tick as the *first* argument to `or` also matters: once
 /// `qr_idle_deadline` has passed, that guarantees it wins even in the instant
-/// a disk sample also happens to be ready, since `or` favors whichever
-/// argument it polls first.
+/// a line also happens to be ready, since `or` favors whichever argument it
+/// polls first.
 async fn next_sample(
     line_rx: &async_channel::Receiver<String>,
-    disk_rx: &async_channel::Receiver<u64>,
-    has_disk_dir: bool,
     qr_idle_deadline: Instant,
 ) -> Sample {
     let next_line = async {
@@ -225,24 +240,11 @@ async fn next_sample(
             Err(_) => Sample::LineChannelClosed,
         }
     };
-    let next_disk_sample = async {
-        if !has_disk_dir {
-            return std::future::pending::<Sample>().await;
-        }
-        match disk_rx.recv().await {
-            Ok(bytes) => Sample::DiskBytes(bytes),
-            Err(_) => std::future::pending::<Sample>().await,
-        }
-    };
     let idle_tick = async {
         smol::Timer::at(qr_idle_deadline).await;
         Sample::Idle
     };
-    futures_lite::future::or(
-        idle_tick,
-        futures_lite::future::or(next_line, next_disk_sample),
-    )
-    .await
+    futures_lite::future::or(idle_tick, next_line).await
 }
 
 /// Reads raw bytes and splits on `\n` ourselves, rather than using
