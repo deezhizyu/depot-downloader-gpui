@@ -422,8 +422,9 @@ fn render_progress(stats: &DownloadStats) -> AnyElement {
             stats.current_depot_percent
         ))
         .child(format!(
-            "Downloaded: {}",
-            format_bytes(stats.downloaded_bytes)
+            "Downloaded: {} of {}",
+            format_bytes(stats.downloaded_bytes),
+            format_bytes(stats.total_size_estimate_bytes)
         ))
         .child(format!(
             "Download speed: {}",

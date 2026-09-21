@@ -14,6 +14,10 @@ pub fn ensure_binary(config: &mut Config) -> anyhow::Result<PathBuf> {
     if let Some(path) = &config.depot_downloader_binary
         && path.is_file()
     {
+        eprintln!(
+            "[depot-downloader-gpui] using previously provisioned DepotDownloader at {}",
+            path.display()
+        );
         return Ok(path.clone());
     }
 
@@ -21,10 +25,20 @@ pub fn ensure_binary(config: &mut Config) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(&install_dir)?;
 
     let archive_path = install_dir.join(asset_file_name());
-    download_release_asset(&archive_path)?;
+    let url = format!("{RELEASE_BASE_URL}/{}", asset_file_name());
+    eprintln!("[depot-downloader-gpui] downloading {url}");
+    download_release_asset(&url, &archive_path)?;
+    eprintln!(
+        "[depot-downloader-gpui] extracting {}",
+        archive_path.display()
+    );
     let binary_path = extract_binary(&archive_path, &install_dir)?;
     make_executable(&binary_path)?;
     let _ = std::fs::remove_file(&archive_path);
+    eprintln!(
+        "[depot-downloader-gpui] DepotDownloader ready at {}",
+        binary_path.display()
+    );
 
     config.depot_downloader_binary = Some(binary_path.clone());
     config.save();
@@ -73,9 +87,8 @@ fn binary_file_name() -> &'static str {
     }
 }
 
-fn download_release_asset(destination: &Path) -> anyhow::Result<()> {
-    let url = format!("{RELEASE_BASE_URL}/{}", asset_file_name());
-    let mut response = ureq::get(&url).call()?;
+fn download_release_asset(url: &str, destination: &Path) -> anyhow::Result<()> {
+    let mut response = ureq::get(url).call()?;
     let mut file = std::fs::File::create(destination)?;
     std::io::copy(&mut response.body_mut().as_reader(), &mut file)?;
     Ok(())
