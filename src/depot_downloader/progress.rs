@@ -61,6 +61,14 @@ pub struct ProgressTracker {
     baseline_disk_bytes: Option<u64>,
     compressed_bytes_from_finished_depots: u64,
     uncompressed_bytes_from_finished_depots: u64,
+    /// Timestamps of recent `-debug` "Downloading chunk ..." lines, for a
+    /// chunks-per-second rate - see `record_chunk_download_started`.
+    chunk_timestamps: VecDeque<Instant>,
+    chunks_seen_in_current_depot: u64,
+    /// Chunk counts for depots that have already finished, alongside their
+    /// already-tracked compressed byte totals, so the average compressed
+    /// bytes per chunk can be learned from real data instead of guessed.
+    chunks_from_finished_depots: u64,
 }
 
 impl ProgressTracker {
@@ -72,6 +80,9 @@ impl ProgressTracker {
             baseline_disk_bytes: None,
             compressed_bytes_from_finished_depots: 0,
             uncompressed_bytes_from_finished_depots: 0,
+            chunk_timestamps: VecDeque::new(),
+            chunks_seen_in_current_depot: 0,
+            chunks_from_finished_depots: 0,
         }
     }
 
@@ -89,6 +100,7 @@ impl ProgressTracker {
                 self.stats.current_depot_id = Some(depot_id);
                 self.stats.current_depot_percent = 0.0;
                 self.percent_samples.clear();
+                self.chunks_seen_in_current_depot = 0;
                 self.stats.status_message = format!("Processing depot {depot_id}");
                 self.clear_login_prompts();
             }
@@ -121,6 +133,7 @@ impl ProgressTracker {
             } => {
                 self.compressed_bytes_from_finished_depots += compressed_bytes;
                 self.uncompressed_bytes_from_finished_depots += uncompressed_bytes;
+                self.chunks_from_finished_depots += self.chunks_seen_in_current_depot;
                 self.stats.status_message = format!("Finished depot {depot_id}");
                 self.recompute_download_speed();
             }
@@ -157,6 +170,10 @@ impl ProgressTracker {
                 // DepotDownloader stays completely silent while one is
                 // pending, so any further line at all means it's done.
                 self.clear_login_prompts();
+            }
+            DownloadEvent::ChunkDownloadStarted => {
+                self.clear_login_prompts();
+                self.record_chunk_download_started();
             }
         }
     }
@@ -229,7 +246,66 @@ impl ProgressTracker {
         self.recompute_eta();
     }
 
+    /// `-debug` prints one line the instant DepotDownloader starts fetching
+    /// each chunk, far more often than a per-file percent tick - so once the
+    /// average compressed chunk size is known (see
+    /// `average_compressed_chunk_bytes`), this drives a network speed
+    /// estimate that updates far more responsively than waiting for the next
+    /// disk poll or percent line.
+    fn record_chunk_download_started(&mut self) {
+        self.chunks_seen_in_current_depot += 1;
+        let now = Instant::now();
+        self.chunk_timestamps.push_back(now);
+        while let Some(&oldest) = self.chunk_timestamps.front() {
+            if now.duration_since(oldest) > SAMPLE_WINDOW {
+                self.chunk_timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.recompute_download_speed();
+    }
+
+    fn recent_chunks_per_sec(&self) -> Option<f64> {
+        let (&t0, &t1) = (
+            self.chunk_timestamps.front()?,
+            self.chunk_timestamps.back()?,
+        );
+        let elapsed = t1.duration_since(t0).as_secs_f64();
+        if elapsed <= 0.0 {
+            return None;
+        }
+        Some((self.chunk_timestamps.len() - 1) as f64 / elapsed)
+    }
+
+    /// The real average compressed size of a chunk in this app, learned from
+    /// depots that have already finished (which report their compressed
+    /// total) rather than assumed - Steam's chunk size varies with
+    /// compression, so a guessed constant would be inaccurate.
+    fn average_compressed_chunk_bytes(&self) -> Option<f64> {
+        if self.chunks_from_finished_depots == 0 {
+            None
+        } else {
+            Some(
+                self.compressed_bytes_from_finished_depots as f64
+                    / self.chunks_from_finished_depots as f64,
+            )
+        }
+    }
+
     fn recompute_download_speed(&mut self) {
+        if let (Some(chunks_per_sec), Some(avg_chunk_bytes)) = (
+            self.recent_chunks_per_sec(),
+            self.average_compressed_chunk_bytes(),
+        ) {
+            self.stats.download_speed_bytes_per_sec = chunks_per_sec * avg_chunk_bytes;
+            return;
+        }
+        // Before any depot has finished (no learned chunk size yet) or once
+        // `-debug` chunk events have aged out of the window, fall back to
+        // scaling the measured disk write speed by the compressed/
+        // uncompressed ratio observed so far (1:1 until the first depot
+        // completes, since that's the only place both figures are reported).
         let compression_ratio = if self.uncompressed_bytes_from_finished_depots > 0 {
             self.compressed_bytes_from_finished_depots as f64
                 / self.uncompressed_bytes_from_finished_depots as f64
@@ -329,6 +405,35 @@ mod tests {
         assert!(
             (stats.download_speed_bytes_per_sec - stats.disk_speed_bytes_per_sec * 0.5).abs() < 1.0
         );
+    }
+
+    #[test]
+    fn download_speed_uses_learned_chunk_rate_once_a_depot_has_finished() {
+        // No apply_disk_sample call in this test at all, so disk_speed_bytes_per_sec
+        // stays at its default 0.0 - meaning the old disk-speed/ratio fallback
+        // would compute exactly 0.0 * ratio = 0.0. Any positive result here can
+        // only have come from the newer chunks-per-second x learned-average-size
+        // path, which is exactly what `-debug` chunk events are for.
+        let mut tracker = ProgressTracker::new();
+
+        // First depot: 10 chunks totalling 1,000,000 compressed bytes -> learns
+        // an average of 100,000 bytes/chunk once it finishes.
+        for _ in 0..10 {
+            tracker.apply_event(DownloadEvent::ChunkDownloadStarted);
+        }
+        tracker.apply_event(DownloadEvent::DepotFinished {
+            depot_id: 1,
+            compressed_bytes: 1_000_000,
+            uncompressed_bytes: 2_000_000,
+        });
+        tracker.apply_event(DownloadEvent::ProcessingDepot { depot_id: 2 });
+
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(20));
+            tracker.apply_event(DownloadEvent::ChunkDownloadStarted);
+        }
+
+        assert!(tracker.stats().download_speed_bytes_per_sec > 0.0);
     }
 
     #[test]

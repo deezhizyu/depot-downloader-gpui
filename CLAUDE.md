@@ -103,11 +103,26 @@ Steam-client download would look, styled to match Zed's own UI.
   whatever was already in the directory before this run (`baseline_disk_bytes`, so a shared or
   reused download folder's pre-existing content isn't mistaken for part of this download) to get
   `total_size_estimate_bytes`, then multiplies that by the current depot's real completion
-  percentage (from CLI output) to get `downloaded_bytes`. Disk/download speed are the rate of
-  change of that estimate over a short sliding window; "download speed" (network) further scales
-  disk throughput by the compressed/uncompressed byte ratio learned from depots that have already
-  finished (1:1 until the first one completes, since that's the only place DepotDownloader reports
-  both figures). ETA is derived from the current depot's percent-per-second rate directly, not
+  percentage (from CLI output) to get `downloaded_bytes`. Disk speed is the rate of change of that
+  estimate over a short sliding window. We always launch with `-debug`, which turns on
+  DepotDownloader's own "Downloading chunk ..." line for every chunk fetched over the network -
+  far more frequent than a per-file percent tick - so once at least one depot has finished (and we
+  therefore know its real compressed byte total), `download speed` is computed directly as
+  chunks-per-second × the learned average compressed bytes per chunk
+  (`ProgressTracker::record_chunk_download_started`/`average_compressed_chunk_bytes`), which is
+  both more accurate (a real observed chunk size, not a guessed constant) and far more responsive
+  than waiting on the next disk poll or percent line. Before any depot has finished, or once
+  `-debug` chunk events have aged out of the smoothing window, `download speed` falls back to
+  scaling disk speed by the compressed/uncompressed byte ratio learned from depots that have
+  already finished (1:1 until the first one completes, since that's the only place DepotDownloader
+  reports both figures). `-debug` also turns on an `EventListener` over several `System.Net.*`
+  sources (Http, Sockets, Security, NameResolution) and TPL, each producing a
+  `"{timestamp}  {source}.{event}(...)"` line per connection lifecycle step with no chunk identity
+  or byte count this app can use; `parser::dotnet_diagnostic_noise` recognizes and drops these
+  outright (no event, not even the `OtherOutput` fallback), and `process::run`'s loop skips
+  sending a UI update for any line that produced no event at all, so this firehose doesn't turn
+  into a Stats-resend-and-re-render storm on a fast connection. ETA is derived from the current
+  depot's percent-per-second rate directly, not
   from a byte estimate, since a depot's total size is never printed while it's running. Both speed
   figures only ever update on genuine growth (strictly more bytes than the oldest sample still in
   the smoothing window, not merely as-many) — a large single file can go longer than the window
