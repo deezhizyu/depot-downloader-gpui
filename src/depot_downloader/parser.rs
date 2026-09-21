@@ -48,6 +48,13 @@ pub enum DownloadEvent {
     ErrorLine {
         message: String,
     },
+    /// A real line that didn't match any of the patterns above. DepotDownloader
+    /// prints plenty of lines this app has no specific use for (license counts,
+    /// depot key results, manifest details, ...), but their mere arrival still
+    /// matters: it is the only signal that login has moved past a Steam Guard
+    /// prompt or QR code, since most of those lines don't otherwise produce an
+    /// event a login prompt could hang off of.
+    OtherOutput,
 }
 
 struct Patterns {
@@ -237,7 +244,7 @@ fn parse_plain_line(line: &str) -> Option<DownloadEvent> {
             path: captures[2].to_string(),
         });
     }
-    None
+    Some(DownloadEvent::OtherOutput)
 }
 
 #[cfg(test)]
@@ -396,6 +403,19 @@ mod tests {
             vec![DownloadEvent::SteamGuardEmailCodeRequested {
                 email: "ab***@example.com".into()
             }]
+        );
+    }
+
+    #[test]
+    fn unrecognized_lines_still_produce_an_event() {
+        // Most of what DepotDownloader prints (license counts, depot key
+        // results, manifest details, ...) doesn't map to a specific event,
+        // but the tracker still needs to hear that *something* arrived, to
+        // know a Steam Guard prompt or QR code is behind it now.
+        let mut parser = OutputParser::new();
+        assert_eq!(
+            parser.feed("Got 368 licenses for account!"),
+            vec![DownloadEvent::OtherOutput]
         );
     }
 }

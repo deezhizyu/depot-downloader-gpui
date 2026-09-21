@@ -150,6 +150,14 @@ impl ProgressTracker {
             DownloadEvent::ErrorLine { message } => {
                 self.stats.error_message = Some(message);
             }
+            DownloadEvent::OtherOutput => {
+                // Most of DepotDownloader's output doesn't map to a specific
+                // event, but its mere arrival is still the only signal that
+                // login has moved past a Steam Guard prompt or QR code -
+                // DepotDownloader stays completely silent while one is
+                // pending, so any further line at all means it's done.
+                self.clear_login_prompts();
+            }
         }
     }
 
@@ -186,7 +194,14 @@ impl ProgressTracker {
             (self.disk_samples.front(), self.disk_samples.back())
         {
             let elapsed = t1.duration_since(t0).as_secs_f64();
-            if elapsed > 0.0 && b1 >= b0 {
+            // Only update on genuine growth (`b1 > b0`, not `>=`): a large
+            // single file can go longer than SAMPLE_WINDOW between
+            // DepotDownloader's own percent updates even while it keeps
+            // writing, which ages every sample still in the window down to
+            // the same value. Requiring strictly-greater means that case
+            // leaves the last known speed in place instead of flashing to a
+            // wrong, literal 0 B/s for as long as the file takes.
+            if elapsed > 0.0 && b1 > b0 {
                 self.stats.disk_speed_bytes_per_sec = (b1 - b0) as f64 / elapsed;
             }
         }
@@ -326,6 +341,48 @@ mod tests {
 
         tracker.apply_event(DownloadEvent::ProcessingDepot { depot_id: 1 });
         assert!(tracker.stats().qr_code_ascii_art.is_none());
+    }
+
+    #[test]
+    fn login_prompts_clear_on_any_output_not_just_recognized_events() {
+        // Most lines DepotDownloader prints right after a successful login
+        // (license counts, AppInfo, depot key results, ...) don't match any
+        // specific pattern, so the QR/prompt must clear on the generic
+        // fallback event too - otherwise it would stay on screen for however
+        // long that unrelated chatter takes, instead of disappearing the
+        // moment login actually finished.
+        let mut tracker = ProgressTracker::new();
+        tracker.apply_event(DownloadEvent::QrCodeReady {
+            ascii_art: "██".into(),
+        });
+        assert!(tracker.stats().qr_code_ascii_art.is_some());
+
+        tracker.apply_event(DownloadEvent::OtherOutput);
+        assert!(tracker.stats().qr_code_ascii_art.is_none());
+    }
+
+    #[test]
+    fn disk_speed_never_resets_to_zero_during_a_long_gap_between_progress_updates() {
+        // A large single file can go longer than SAMPLE_WINDOW between
+        // DepotDownloader's own percent-line updates, even while it keeps
+        // writing the whole time. Once every sample still in the smoothing
+        // window shares the same value, speed must hold its last known
+        // reading rather than flashing to a literal 0 B/s for however long
+        // that file takes.
+        let mut tracker = ProgressTracker::new();
+        let start = Instant::now();
+        tracker.apply_disk_sample(0, start);
+        tracker.apply_event(DownloadEvent::FileProgress {
+            percent: 10.0,
+            path: "big.bin".into(),
+        });
+        tracker.apply_disk_sample(10_000_000, start + Duration::from_secs(1));
+        assert!(tracker.stats().disk_speed_bytes_per_sec > 0.0);
+
+        for seconds in [3, 5, 7, 9, 11] {
+            tracker.apply_disk_sample(10_000_000, start + Duration::from_secs(seconds));
+        }
+        assert!(tracker.stats().disk_speed_bytes_per_sec > 0.0);
     }
 
     #[test]
