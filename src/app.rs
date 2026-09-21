@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use gpui_kit::base::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -218,6 +218,27 @@ impl RootView {
         }
     }
 
+    fn browse_for_download_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose a download location".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(mut paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.pop() else { return };
+            let _ = this.update_in(cx, |view, window, cx| {
+                view.download_dir_input.update(cx, |state, cx| {
+                    state.set_value(path.to_string_lossy().into_owned(), window, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
     fn submit_guard_code(&mut self, cx: &mut Context<Self>) {
         let code = self.guard_code_input.read(cx).value().trim().to_string();
         let Some(sender) = self.respond_sender.clone() else {
@@ -294,7 +315,16 @@ impl RootView {
             ))
             .child(labeled_field(
                 "Download location",
-                Input::new(&self.download_dir_input),
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().child(Input::new(&self.download_dir_input)))
+                    .child(
+                        Button::new("browse-download-dir")
+                            .label("Browse…")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.browse_for_download_dir(window, cx);
+                            })),
+                    ),
             ))
             .child(self.render_login_mode_toggle(cx))
             .child(self.render_login_fields(cx))
@@ -359,6 +389,7 @@ impl Render for RootView {
             .id("root")
             .size_full()
             .bg(cx.theme().colors.background)
+            .child(TitleBar::new().child("DepotDownloader"))
             .child(
                 v_flex()
                     .id("content")
