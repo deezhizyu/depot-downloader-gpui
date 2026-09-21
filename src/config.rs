@@ -12,6 +12,10 @@ pub struct Config {
     pub last_app_id: String,
     pub last_download_location: Option<PathBuf>,
     pub depot_downloader_binary: Option<PathBuf>,
+    /// The Steam account name of a remembered login (see
+    /// `depot_downloader::process::LoginMethod::RememberedUsername`), or `None`
+    /// if the user hasn't logged in yet or has logged out.
+    pub logged_in_username: Option<String>,
 }
 
 impl Config {

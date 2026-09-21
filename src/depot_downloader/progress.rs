@@ -45,6 +45,12 @@ pub struct DownloadStats {
     pub eta: Option<Duration>,
     pub auth_prompt: Option<AuthPrompt>,
     pub qr_code_ascii_art: Option<String>,
+    /// The account name a QR login resolved to, once DepotDownloader prints
+    /// its "Success! Next time you can login with -username ..." line - the
+    /// only place that name appears as text (see
+    /// `DownloadEvent::QrLoginRemembered`). `None` for username/password
+    /// logins, where the caller already knows the username directly.
+    pub qr_resolved_username: Option<String>,
     pub error_message: Option<String>,
     pub is_finished: bool,
     pub final_compressed_bytes: Option<u64>,
@@ -159,6 +165,10 @@ impl ProgressTracker {
             }
             DownloadEvent::QrCodeReady { ascii_art } => {
                 self.stats.qr_code_ascii_art = Some(ascii_art);
+            }
+            DownloadEvent::QrLoginRemembered { username } => {
+                self.stats.qr_resolved_username = Some(username);
+                self.clear_login_prompts();
             }
             DownloadEvent::ErrorLine { message } => {
                 self.stats.error_message = Some(message);
@@ -445,6 +455,22 @@ mod tests {
         assert!(tracker.stats().qr_code_ascii_art.is_some());
 
         tracker.apply_event(DownloadEvent::ProcessingDepot { depot_id: 1 });
+        assert!(tracker.stats().qr_code_ascii_art.is_none());
+    }
+
+    #[test]
+    fn qr_login_remembered_records_resolved_username_and_clears_prompts() {
+        let mut tracker = ProgressTracker::new();
+        tracker.apply_event(DownloadEvent::QrCodeReady {
+            ascii_art: "██".into(),
+        });
+        tracker.apply_event(DownloadEvent::QrLoginRemembered {
+            username: "catyoutube2".into(),
+        });
+        assert_eq!(
+            tracker.stats().qr_resolved_username,
+            Some("catyoutube2".to_string())
+        );
         assert!(tracker.stats().qr_code_ascii_art.is_none());
     }
 

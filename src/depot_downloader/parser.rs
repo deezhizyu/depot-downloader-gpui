@@ -45,6 +45,14 @@ pub enum DownloadEvent {
     QrCodeReady {
         ascii_art: String,
     },
+    /// DepotDownloader prints this exact line once, right after a QR login
+    /// succeeds, naming the account that just logged in - the only place a
+    /// QR-resolved account name ever appears as text, since DepotDownloader
+    /// never echoes it otherwise. Used to remember the login for next time
+    /// (see `LoginMethod::RememberedUsername`).
+    QrLoginRemembered {
+        username: String,
+    },
     ErrorLine {
         message: String,
     },
@@ -74,6 +82,7 @@ struct Patterns {
     depot_finished: Regex,
     total_downloaded: Regex,
     steam_guard_email: Regex,
+    qr_login_remembered: Regex,
     chunk_download_started: Regex,
     dotnet_diagnostic_noise: Regex,
 }
@@ -97,6 +106,11 @@ static PATTERNS: LazyLock<Patterns> = LazyLock::new(|| Patterns {
     steam_guard_email: Regex::new(
         r"^STEAM GUARD! Please enter the auth code sent to the email at (.+):$",
     )
+    .unwrap(),
+    qr_login_remembered: Regex::new(concat!(
+        r"^Success! Next time you can login with -username (.+) ",
+        r"-remember-password instead of -qr\.$"
+    ))
     .unwrap(),
     // DepotDownloader's DebugLog writes every line as "[{category}] {message}";
     // this specific message always comes from the "ContentDownloader" category.
@@ -250,6 +264,11 @@ fn parse_plain_line(line: &str) -> Option<DownloadEvent> {
     if let Some(captures) = patterns.steam_guard_email.captures(line) {
         return Some(DownloadEvent::SteamGuardEmailCodeRequested {
             email: captures[1].to_string(),
+        });
+    }
+    if let Some(captures) = patterns.qr_login_remembered.captures(line) {
+        return Some(DownloadEvent::QrLoginRemembered {
+            username: captures[1].to_string(),
         });
     }
     if line.starts_with("STEAM GUARD!") && line.contains("2-factor auth code") {
@@ -444,6 +463,20 @@ mod tests {
         assert_eq!(
             parser.feed("Got 368 licenses for account!"),
             vec![DownloadEvent::OtherOutput]
+        );
+    }
+
+    #[test]
+    fn recognizes_qr_login_remembered_line() {
+        let mut parser = OutputParser::new();
+        assert_eq!(
+            parser.feed(
+                "Success! Next time you can login with -username catyoutube2 \
+                 -remember-password instead of -qr."
+            ),
+            vec![DownloadEvent::QrLoginRemembered {
+                username: "catyoutube2".into()
+            }]
         );
     }
 
