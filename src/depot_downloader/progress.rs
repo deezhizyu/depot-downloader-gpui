@@ -24,10 +24,18 @@ pub struct DownloadStats {
     /// resets this per depot, so it is not the whole run's percentage when an
     /// app has more than one depot to fetch.
     pub current_depot_percent: f32,
-    /// Bytes written to the download directory right now, measured directly
-    /// from disk rather than parsed from CLI output (DepotDownloader never
-    /// prints a running byte total).
+    /// Estimated bytes downloaded so far for the current depot: DepotDownloader
+    /// pre-allocates each file to its full final size as soon as it creates it,
+    /// so raw bytes-on-disk jumps to the total almost immediately and can't be
+    /// used as a progress counter on its own (see `total_size_estimate_bytes`).
+    /// This combines that allocated total with the depot's real completion
+    /// percentage (from CLI output) to approximate bytes actually written.
     pub downloaded_bytes: u64,
+    /// Bytes DepotDownloader has allocated on disk for the current download,
+    /// net of whatever was already in the destination directory before this
+    /// run started. This is the total-size denominator DepotDownloader itself
+    /// never prints, recovered from its own pre-allocation behavior.
+    pub total_size_estimate_bytes: u64,
     pub disk_speed_bytes_per_sec: f64,
     /// Estimated network throughput: measured disk speed scaled by the
     /// compressed/uncompressed ratio observed on depots finished so far
@@ -47,6 +55,10 @@ pub struct ProgressTracker {
     stats: DownloadStats,
     percent_samples: VecDeque<(Instant, f32)>,
     disk_samples: VecDeque<(Instant, u64)>,
+    /// Bytes already on disk when polling started, so a shared or reused
+    /// download directory's pre-existing content isn't counted as part of
+    /// this download's total.
+    baseline_disk_bytes: Option<u64>,
     compressed_bytes_from_finished_depots: u64,
     uncompressed_bytes_from_finished_depots: u64,
 }
@@ -57,6 +69,7 @@ impl ProgressTracker {
             stats: DownloadStats::default(),
             percent_samples: VecDeque::new(),
             disk_samples: VecDeque::new(),
+            baseline_disk_bytes: None,
             compressed_bytes_from_finished_depots: 0,
             uncompressed_bytes_from_finished_depots: 0,
         }
@@ -77,18 +90,22 @@ impl ProgressTracker {
                 self.stats.current_depot_percent = 0.0;
                 self.percent_samples.clear();
                 self.stats.status_message = format!("Processing depot {depot_id}");
+                self.clear_login_prompts();
             }
             DownloadEvent::DownloadingDepotManifest { depot_id } => {
                 self.stats.status_message = format!("Downloading manifest for depot {depot_id}");
+                self.clear_login_prompts();
             }
             DownloadEvent::DownloadingDepot { depot_id } => {
                 self.stats.current_depot_id = Some(depot_id);
                 self.stats.status_message = format!("Downloading depot {depot_id}");
+                self.clear_login_prompts();
             }
             DownloadEvent::FileProgress { percent, path } => {
                 self.stats.current_depot_percent = percent;
                 self.stats.status_message = format!("{percent:.2}% - {path}");
                 self.record_percent_sample(percent);
+                self.clear_login_prompts();
             }
             DownloadEvent::OverallProgress { percent } => {
                 // DepotDownloader only emits this when stdout is a real
@@ -136,13 +153,27 @@ impl ProgressTracker {
         }
     }
 
-    /// Feeds in the current size, in bytes, of everything DepotDownloader has
-    /// written to the download directory so far. Called periodically by the
-    /// process supervisor, which is the only place that actually knows the
-    /// destination path.
+    /// Feeds in the current size, in bytes, of everything in the download
+    /// directory right now. Called periodically by the process supervisor,
+    /// which is the only place that actually knows the destination path.
+    ///
+    /// This can't be used as a live "bytes downloaded" counter directly:
+    /// DepotDownloader pre-allocates each file to its full final size the
+    /// moment it creates it, so the directory's size jumps to (close to) the
+    /// total almost instantly, long before the data has actually arrived.
+    /// What it's good for is recovering the total size DepotDownloader never
+    /// prints - so it becomes the denominator, and the depot's own completion
+    /// percentage (from CLI output) becomes the numerator.
     pub fn apply_disk_sample(&mut self, bytes_on_disk: u64, at: Instant) {
-        self.stats.downloaded_bytes = bytes_on_disk;
-        self.disk_samples.push_back((at, bytes_on_disk));
+        let baseline = *self.baseline_disk_bytes.get_or_insert(bytes_on_disk);
+        let total_estimate = bytes_on_disk.saturating_sub(baseline);
+        self.stats.total_size_estimate_bytes = total_estimate;
+
+        let downloaded =
+            (total_estimate as f64 * (self.stats.current_depot_percent as f64 / 100.0)) as u64;
+        self.stats.downloaded_bytes = downloaded;
+
+        self.disk_samples.push_back((at, downloaded));
         while let Some(&(sample_time, _)) = self.disk_samples.front() {
             if at.duration_since(sample_time) > SAMPLE_WINDOW {
                 self.disk_samples.pop_front();
@@ -161,6 +192,13 @@ impl ProgressTracker {
         }
         self.recompute_download_speed();
         self.recompute_eta();
+    }
+
+    /// A Steam Guard prompt or QR code only matters until login finishes;
+    /// once real depot activity resumes, DepotDownloader is done with them.
+    fn clear_login_prompts(&mut self) {
+        self.stats.auth_prompt = None;
+        self.stats.qr_code_ascii_art = None;
     }
 
     fn record_percent_sample(&mut self, percent: f32) {
@@ -221,13 +259,40 @@ mod tests {
     }
 
     #[test]
-    fn disk_speed_comes_from_disk_samples_not_cli_output() {
+    fn disk_sample_is_scaled_by_depot_percent_not_used_raw() {
+        // DepotDownloader pre-allocates files to their full size immediately,
+        // so a raw disk sample must not be reported as "downloaded" on its
+        // own - only the percent-scaled estimate should be.
         let mut tracker = ProgressTracker::new();
         let start = Instant::now();
-        tracker.apply_disk_sample(0, start);
+        tracker.apply_disk_sample(10_000_000, start);
+        assert_eq!(tracker.stats().total_size_estimate_bytes, 0);
+        assert_eq!(tracker.stats().downloaded_bytes, 0);
+
+        tracker.apply_event(DownloadEvent::FileProgress {
+            percent: 50.0,
+            path: "a".into(),
+        });
         tracker.apply_disk_sample(10_000_000, start + Duration::from_secs(1));
-        assert!(tracker.stats().disk_speed_bytes_per_sec > 0.0);
+        assert_eq!(tracker.stats().total_size_estimate_bytes, 0);
+        assert_eq!(tracker.stats().downloaded_bytes, 0);
+    }
+
+    #[test]
+    fn disk_sample_baseline_excludes_pre_existing_directory_content() {
+        // A shared/reused download directory already has bytes in it before
+        // this run starts; only growth past that baseline counts.
+        let mut tracker = ProgressTracker::new();
+        let start = Instant::now();
+        tracker.apply_disk_sample(19_000_000_000, start);
+        tracker.apply_event(DownloadEvent::FileProgress {
+            percent: 100.0,
+            path: "a".into(),
+        });
+        tracker.apply_disk_sample(19_010_000_000, start + Duration::from_secs(1));
+        assert_eq!(tracker.stats().total_size_estimate_bytes, 10_000_000);
         assert_eq!(tracker.stats().downloaded_bytes, 10_000_000);
+        assert!(tracker.stats().disk_speed_bytes_per_sec > 0.0);
     }
 
     #[test]
@@ -240,11 +305,27 @@ mod tests {
             compressed_bytes: 50,
             uncompressed_bytes: 100,
         });
+        tracker.apply_event(DownloadEvent::FileProgress {
+            percent: 100.0,
+            path: "a".into(),
+        });
         tracker.apply_disk_sample(10_000_000, start + Duration::from_secs(1));
         let stats = tracker.stats();
         assert!(
             (stats.download_speed_bytes_per_sec - stats.disk_speed_bytes_per_sec * 0.5).abs() < 1.0
         );
+    }
+
+    #[test]
+    fn login_prompts_clear_once_real_depot_activity_resumes() {
+        let mut tracker = ProgressTracker::new();
+        tracker.apply_event(DownloadEvent::QrCodeReady {
+            ascii_art: "██".into(),
+        });
+        assert!(tracker.stats().qr_code_ascii_art.is_some());
+
+        tracker.apply_event(DownloadEvent::ProcessingDepot { depot_id: 1 });
+        assert!(tracker.stats().qr_code_ascii_art.is_none());
     }
 
     #[test]

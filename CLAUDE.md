@@ -61,14 +61,28 @@ Steam-client download would look, styled to match Zed's own UI.
   QR login is similar: DepotDownloader renders the QR code as ASCII/Unicode block art in the
   terminal and never prints the underlying URL as text, so we capture that block verbatim and
   render it in a monospace font rather than trying to decode it back into a module grid.
-- **Progress numbers** (`depot_downloader::progress`): since DepotDownloader doesn't expose a
-  running byte counter, "downloaded bytes" and "disk speed" are measured directly — by polling
-  the actual size on disk of the download directory (`depot_downloader::process`'s disk poller)
-  rather than estimating them from percentages. "Download speed" (network) is that measured disk
-  throughput scaled by the compressed/uncompressed byte ratio learned from depots that have
-  already finished (1:1 until the first one completes, since that's the only place
-  DepotDownloader reports both figures). ETA is derived from the current depot's percent-per-second
-  rate, not from a byte estimate, since a depot's total size is never printed while it's running.
+- **Progress numbers** (`depot_downloader::progress`): DepotDownloader never prints a running
+  byte counter, and polling the download directory's raw size on disk (`depot_downloader::process`'s
+  disk poller) can't stand in for one directly — DepotDownloader pre-allocates each file to its
+  full final size the moment it creates it, so the directory's size jumps to (near) the total
+  almost instantly, long before the data has actually arrived. What that polling *is* good for is
+  recovering the total size DepotDownloader itself never prints: `ProgressTracker` nets out
+  whatever was already in the directory before this run (`baseline_disk_bytes`, so a shared or
+  reused download folder's pre-existing content isn't mistaken for part of this download) to get
+  `total_size_estimate_bytes`, then multiplies that by the current depot's real completion
+  percentage (from CLI output) to get `downloaded_bytes`. Disk/download speed are the rate of
+  change of that estimate over a short sliding window; "download speed" (network) further scales
+  disk throughput by the compressed/uncompressed byte ratio learned from depots that have already
+  finished (1:1 until the first one completes, since that's the only place DepotDownloader reports
+  both figures). ETA is derived from the current depot's percent-per-second rate directly, not
+  from a byte estimate, since a depot's total size is never printed while it's running. A Steam
+  Guard prompt or QR code is cleared from `DownloadStats` as soon as real depot activity resumes
+  (`ProcessingDepot`/`DownloadingDepot`/`FileProgress`), since otherwise it would stay set for the
+  rest of the run and permanently block the progress view from showing.
+- **Console logging**: `depot_downloader::process` and `provisioning` print `eprintln!` lines
+  (DepotDownloader's own stdout/stderr verbatim, plus the launch command with the password
+  redacted, exit status, and provisioning steps) so a stuck or confusing run can be diagnosed by
+  running the app from a terminal, without needing a dedicated logging crate.
 - **Process I/O**: `async-process` + `smol` (already in gpui's own dependency tree, so this adds
   no new runtime) rather than `tokio`, since gpui's executor is smol-based.
 - **Config persistence**: the last app id, last download location, and the resolved

@@ -44,6 +44,18 @@ impl DownloadRequest {
         }
         args
     }
+
+    /// Same as [`Self::build_args`], but with the password blanked out, for
+    /// logging the launch command without leaking credentials to the console.
+    fn build_args_for_logging(&self) -> Vec<String> {
+        let mut args = self.build_args();
+        if let Some(password_position) = args.iter().position(|arg| arg == "-password")
+            && let Some(password) = args.get_mut(password_position + 1)
+        {
+            "***".clone_into(password);
+        }
+        args
+    }
 }
 
 pub enum ProcessEvent {
@@ -72,6 +84,12 @@ pub async fn run(
         return;
     }
 
+    eprintln!(
+        "[depot-downloader-gpui] launching {} {}",
+        request.depot_downloader_binary.display(),
+        request.build_args_for_logging().join(" ")
+    );
+
     let mut child = match Command::new(&request.depot_downloader_binary)
         .args(request.build_args())
         .stdin(Stdio::piped())
@@ -81,6 +99,7 @@ pub async fn run(
     {
         Ok(child) => child,
         Err(error) => {
+            eprintln!("[depot-downloader-gpui] failed to launch DepotDownloader: {error}");
             let _ = updates
                 .send(ProcessEvent::FailedToStart(format!(
                     "Could not start DepotDownloader: {error}"
@@ -137,6 +156,7 @@ pub async fn run(
     }
 
     let status = child.status().await;
+    eprintln!("[depot-downloader-gpui] DepotDownloader exited with {status:?}");
     let _ = updates.send(ProcessEvent::Exited(status)).await;
 }
 
@@ -175,6 +195,7 @@ async fn forward_lines(
 ) {
     let mut lines = BufReader::new(reader).lines();
     while let Some(Ok(line)) = lines.next().await {
+        eprintln!("[DepotDownloader] {line}");
         if sink.send(line).await.is_err() {
             break;
         }
@@ -182,6 +203,10 @@ async fn forward_lines(
 }
 
 async fn poll_disk_usage(dir: PathBuf, sink: async_channel::Sender<u64>) {
+    eprintln!(
+        "[depot-downloader-gpui] watching disk usage of {}",
+        dir.display()
+    );
     loop {
         let scan_dir = dir.clone();
         let size = smol::unblock(move || directory_size(&scan_dir)).await;
