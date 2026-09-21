@@ -140,16 +140,21 @@ pub async fn run(
 
     let mut parser = OutputParser::new();
     let mut tracker = ProgressTracker::new();
+    // Only pushed forward by real output (`Sample::Line`), never by a disk
+    // sample - see `next_sample`'s doc comment for why that distinction matters.
+    let mut qr_idle_deadline = Instant::now() + QR_FLUSH_IDLE_TIMEOUT;
 
     loop {
-        match next_sample(&line_rx, &disk_rx, has_disk_dir).await {
+        match next_sample(&line_rx, &disk_rx, has_disk_dir, qr_idle_deadline).await {
             Sample::Line(line) => {
+                qr_idle_deadline = Instant::now() + QR_FLUSH_IDLE_TIMEOUT;
                 for event in parser.feed(&line) {
                     tracker.apply_event(event);
                 }
             }
             Sample::DiskBytes(bytes) => tracker.apply_disk_sample(bytes, Instant::now()),
             Sample::Idle => {
+                qr_idle_deadline = Instant::now() + QR_FLUSH_IDLE_TIMEOUT;
                 if let Some(event) = parser.flush_pending_qr_block() {
                     eprintln!("[depot-downloader-gpui] QR code ready (no further output arrived)");
                     tracker.apply_event(event);
@@ -178,10 +183,26 @@ enum Sample {
     LineChannelClosed,
 }
 
+/// `qr_idle_deadline` is an absolute point in time, carried across every call
+/// from `run`'s loop and advanced only when a `Sample::Line` is actually
+/// processed - never when a disk sample is. That distinction is load-bearing:
+/// disk usage is polled unconditionally every `DISK_POLL_INTERVAL` (500ms),
+/// faster than `QR_FLUSH_IDLE_TIMEOUT` (700ms), for as long as a download
+/// directory is set (the common case). An earlier version built a fresh
+/// `Timer::after(QR_FLUSH_IDLE_TIMEOUT)` on every call instead, so each disk
+/// sample - not real DepotDownloader output - restarted its 700ms window
+/// before it could ever elapse, starving the QR flush indefinitely: the QR
+/// code silently never appeared until something else (like the next QR
+/// refresh's own heading) happened to end the block for an unrelated reason.
+/// Racing the idle tick as the *first* argument to `or` also matters: once
+/// `qr_idle_deadline` has passed, that guarantees it wins even in the instant
+/// a disk sample also happens to be ready, since `or` favors whichever
+/// argument it polls first.
 async fn next_sample(
     line_rx: &async_channel::Receiver<String>,
     disk_rx: &async_channel::Receiver<u64>,
     has_disk_dir: bool,
+    qr_idle_deadline: Instant,
 ) -> Sample {
     let next_line = async {
         match line_rx.recv().await {
@@ -198,16 +219,13 @@ async fn next_sample(
             Err(_) => std::future::pending::<Sample>().await,
         }
     };
-    // Recreated fresh on every call, so it naturally debounces: any line or
-    // disk sample arriving first cancels it, and it only ever fires after a
-    // real idle gap.
     let idle_tick = async {
-        smol::Timer::after(QR_FLUSH_IDLE_TIMEOUT).await;
+        smol::Timer::at(qr_idle_deadline).await;
         Sample::Idle
     };
     futures_lite::future::or(
-        futures_lite::future::or(next_line, next_disk_sample),
         idle_tick,
+        futures_lite::future::or(next_line, next_disk_sample),
     )
     .await
 }
