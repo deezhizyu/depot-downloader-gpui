@@ -59,10 +59,14 @@ Steam-client download would look, styled to match Zed's own UI.
   percentage; DepotDownloader never prints an absolute byte total while downloading, only once a
   depot (`"Depot N - Downloaded ..."`) or the whole run (`"Total downloaded: ..."`) finishes.
   QR login is similar: DepotDownloader renders the QR code as ASCII/Unicode block art in the
-  terminal and never prints the underlying URL as text, so we capture that block verbatim and
-  render it in a monospace font rather than trying to decode it back into a module grid. It then
-  blocks silently waiting for the phone to confirm the scan, so no line ever marks where the
-  block ends either — `process::run`'s read loop races a short idle timer
+  terminal and never prints the underlying URL as text, so we capture that block verbatim. We do
+  not render it as text, though: each QR module is drawn as two `'█'` (U+2588 FULL BLOCK)
+  characters or two spaces, and that glyph isn't in IBM Plex Mono, so text rendering produced a
+  blank area even once the text itself was captured correctly. `app::render_qr_code` instead
+  samples one character per module (`step_by(2)`) and draws each module as an explicit
+  black/white square `div`, which is correct regardless of font and reads reliably by a phone
+  camera. It then blocks silently waiting for the phone to confirm the scan, so no line ever
+  marks where the block ends either — `process::run`'s read loop races a short idle timer
   (`QR_FLUSH_IDLE_TIMEOUT`) against new output and calls
   `OutputParser::flush_pending_qr_block` once things go quiet, rather than waiting for a
   terminator that will never come.
