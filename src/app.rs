@@ -344,11 +344,7 @@ impl RootView {
             RunState::ShowingQrCode { ascii_art } => v_flex()
                 .gap_2()
                 .child("Scan this with the Steam Mobile app:")
-                .child(
-                    v_flex()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .children(ascii_art.lines().map(str::to_string)),
-                )
+                .child(render_qr_code(ascii_art))
                 .into_any_element(),
             RunState::AwaitingSteamGuardCode => {
                 self.render_guard_code_prompt("Enter your Steam Guard code", cx)
@@ -410,6 +406,41 @@ fn status_line(message: &str, cx: &mut Context<RootView>) -> AnyElement {
     div()
         .text_color(cx.theme().colors.muted_foreground)
         .child(message.to_string())
+        .into_any_element()
+}
+
+/// DepotDownloader renders its QR code as terminal block art, with each
+/// module drawn as two identical characters (`"██"` or `"  "`) so it reads
+/// roughly square in a typical terminal font. Rendering that text verbatim
+/// depends on the UI font having a glyph for U+2588 FULL BLOCK, which
+/// IBM Plex Mono does not - so instead this samples one character per module
+/// (`step_by(2)`) and draws each module as an explicit black/white square,
+/// which is correct regardless of font and reads reliably by a phone camera.
+fn render_qr_code(ascii_art: &str) -> AnyElement {
+    const MODULE_SIZE: Pixels = px(6.0);
+
+    let rows = ascii_art
+        .lines()
+        .map(|line| {
+            line.chars()
+                .step_by(2)
+                .map(|glyph| glyph == '█')
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    div()
+        .bg(rgb(0xFFFFFF))
+        .p(px(12.0))
+        .child(v_flex().children(rows.into_iter().map(|row| {
+            h_flex().children(row.into_iter().map(|is_dark_module| {
+                div().size(MODULE_SIZE).bg(if is_dark_module {
+                    rgb(0x000000)
+                } else {
+                    rgb(0xFFFFFF)
+                })
+            }))
+        })))
         .into_any_element()
 }
 
