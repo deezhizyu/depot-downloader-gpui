@@ -33,7 +33,14 @@ pub struct DownloadRequest {
 
 impl DownloadRequest {
     fn build_args(&self) -> Vec<String> {
-        let mut args = vec!["-app".to_string(), self.app_id.clone()];
+        // -debug enables per-chunk "Downloading chunk ..." lines, the
+        // finest-grained progress signal DepotDownloader offers - see
+        // ProgressTracker::record_chunk_download_started for what it buys us.
+        let mut args = vec![
+            "-app".to_string(),
+            self.app_id.clone(),
+            "-debug".to_string(),
+        ];
         if let Some(dir) = &self.download_dir {
             args.push("-dir".to_string());
             args.push(dir.to_string_lossy().into_owned());
@@ -148,7 +155,15 @@ pub async fn run(
         match next_sample(&line_rx, &disk_rx, has_disk_dir, qr_idle_deadline).await {
             Sample::Line(line) => {
                 qr_idle_deadline = Instant::now() + QR_FLUSH_IDLE_TIMEOUT;
-                for event in parser.feed(&line) {
+                let events = parser.feed(&line);
+                // `-debug` also enables .NET's HttpClient diagnostics, which
+                // produce no event at all (see `parser::dotnet_diagnostic_noise`).
+                // Skipping the UI update for those keeps a fast download from
+                // triggering a Stats resend + re-render on every single one.
+                if events.is_empty() {
+                    continue;
+                }
+                for event in events {
                     tracker.apply_event(event);
                 }
             }

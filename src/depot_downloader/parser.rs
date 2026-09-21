@@ -55,6 +55,13 @@ pub enum DownloadEvent {
     /// prompt or QR code, since most of those lines don't otherwise produce an
     /// event a login prompt could hang off of.
     OtherOutput,
+    /// DepotDownloader has started fetching one chunk over the network
+    /// (`-debug` output). This is the finest-grained, most frequent activity
+    /// signal available - far more often than a per-file percent tick - so
+    /// it drives a much more responsive network speed estimate once the
+    /// average compressed chunk size is known (see
+    /// `ProgressTracker::record_chunk_download_started`).
+    ChunkDownloadStarted,
 }
 
 struct Patterns {
@@ -67,6 +74,8 @@ struct Patterns {
     depot_finished: Regex,
     total_downloaded: Regex,
     steam_guard_email: Regex,
+    chunk_download_started: Regex,
+    dotnet_diagnostic_noise: Regex,
 }
 
 static PATTERNS: LazyLock<Patterns> = LazyLock::new(|| Patterns {
@@ -89,6 +98,19 @@ static PATTERNS: LazyLock<Patterns> = LazyLock::new(|| Patterns {
         r"^STEAM GUARD! Please enter the auth code sent to the email at (.+):$",
     )
     .unwrap(),
+    // DepotDownloader's DebugLog writes every line as "[{category}] {message}";
+    // this specific message always comes from the "ContentDownloader" category.
+    chunk_download_started: Regex::new(
+        r"^\[ContentDownloader\] Downloading chunk [0-9a-fA-F]{40} from .+$",
+    )
+    .unwrap(),
+    // `-debug` also installs an EventListener over several System.Net.* and
+    // TPL diagnostic sources, each writing one "{timestamp}  {source}.{event}(...)"
+    // line per HTTP/socket/TLS/DNS lifecycle step. They carry no chunk identity
+    // or byte count this app can use, and there can be many per chunk, so any
+    // line in that exact shape is pure noise to this parser regardless of
+    // which of those sources it came from.
+    dotnet_diagnostic_noise: Regex::new(r"^\d{2}:\d{2}:\d{2}\.\d+\s+\S+\(").unwrap(),
 });
 
 /// Turns DepotDownloader's raw stdout lines into [`DownloadEvent`]s.
@@ -188,6 +210,9 @@ fn is_qr_art_line(line: &str) -> bool {
 fn parse_plain_line(line: &str) -> Option<DownloadEvent> {
     let patterns = &*PATTERNS;
 
+    if patterns.dotnet_diagnostic_noise.is_match(line) {
+        return None;
+    }
     if let Some(captures) = patterns.using_branch.captures(line) {
         return Some(DownloadEvent::UsingBranch {
             branch: captures[1].to_string(),
@@ -243,6 +268,9 @@ fn parse_plain_line(line: &str) -> Option<DownloadEvent> {
             percent: captures[1].parse().ok()?,
             path: captures[2].to_string(),
         });
+    }
+    if patterns.chunk_download_started.is_match(line) {
+        return Some(DownloadEvent::ChunkDownloadStarted);
     }
     Some(DownloadEvent::OtherOutput)
 }
@@ -416,6 +444,50 @@ mod tests {
         assert_eq!(
             parser.feed("Got 368 licenses for account!"),
             vec![DownloadEvent::OtherOutput]
+        );
+    }
+
+    #[test]
+    fn recognizes_debug_chunk_download_lines() {
+        // DepotDownloader's DebugLog prints every line as "[{category}] {message}" -
+        // the category prefix is part of the real line, not something this
+        // app adds itself.
+        let mut parser = OutputParser::new();
+        assert_eq!(
+            parser.feed(
+                "[ContentDownloader] Downloading chunk 01fbf4de2a95211bcee1996a448fbaa8c95b63f1 \
+                 from cache1-vie1.steamcontent.com:443 (SteamCache) with no proxy"
+            ),
+            vec![DownloadEvent::ChunkDownloadStarted]
+        );
+    }
+
+    #[test]
+    fn ignores_dotnet_diagnostic_noise_from_debug_mode() {
+        // `-debug` also installs an EventListener over several System.Net.*
+        // sources (Http, Sockets, Security, NameResolution) plus TPL, each
+        // producing timestamped lines with no chunk identity or byte count
+        // this app can use - they must produce no event at all (not even the
+        // generic OtherOutput fallback), or a fast download would flood the
+        // UI with pointless redundant updates.
+        let mut parser = OutputParser::new();
+        assert!(
+            parser
+                .feed(
+                    "11:09:23.0206251  System.Net.Http.RequestStart(scheme: https, \
+                     host: cache1-vie1.steamcontent.com, port: 443)"
+                )
+                .is_empty()
+        );
+        assert!(
+            parser
+                .feed("11:09:23.0501967  System.Net.Http.RequestStop(statusCode: 200)")
+                .is_empty()
+        );
+        assert!(
+            parser
+                .feed("11:09:23.0538919  System.Net.Sockets.ConnectStart(address: 1.2.3.4)")
+                .is_empty()
         );
     }
 }
