@@ -121,7 +121,16 @@ Steam-client download would look, styled to match Zed's own UI.
   or byte count this app can use; `parser::dotnet_diagnostic_noise` recognizes and drops these
   outright (no event, not even the `OtherOutput` fallback), and `process::run`'s loop skips
   sending a UI update for any line that produced no event at all, so this firehose doesn't turn
-  into a Stats-resend-and-re-render storm on a fast connection. ETA is derived from the current
+  into a Stats-resend-and-re-render storm on a fast connection. That same firehose also broke disk
+  polling outright at first: `process::run`'s loop used to pick its next sample by racing a
+  `next_line` future against a `next_disk_sample` future with `futures_lite::future::or`, which
+  always polls its first argument first and returns immediately if it's ready. Once `-debug` could
+  keep `line_rx` continuously non-empty, `next_disk_sample` stopped being polled at all for as long
+  as that backlog lasted — in practice, for the whole download — so `Downloaded`, `Download speed`,
+  and `Disk speed` froze at zero even while the percent-based fields kept updating normally. The fix
+  was to stop racing disk samples at all: `run`'s loop now drains `disk_rx` non-blockingly with
+  `try_recv` at the top of every iteration, unconditionally, before it does anything else, so no
+  amount of line volume can delay them. ETA is derived from the current
   depot's percent-per-second rate directly, not
   from a byte estimate, since a depot's total size is never printed while it's running. Both speed
   figures only ever update on genuine growth (strictly more bytes than the oldest sample still in
