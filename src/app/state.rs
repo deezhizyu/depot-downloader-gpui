@@ -33,6 +33,12 @@ pub(super) enum RunState {
         message: String,
     },
     AwaitingSteamGuardConfirmation,
+    /// DepotDownloader exited unexpectedly (a dropped Steam connection is the
+    /// common cause) and a retry is queued; `attempt` is 1-based against
+    /// `session::MAX_RETRIES`.
+    Reconnecting {
+        attempt: u32,
+    },
     /// The process was stopped by our own `request_pause`, not by
     /// DepotDownloader itself - `stats` is the last snapshot before it
     /// stopped. `resume_download` relaunches with the remembered login,

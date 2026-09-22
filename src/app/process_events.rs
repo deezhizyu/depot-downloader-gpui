@@ -1,9 +1,11 @@
+use gpui_kit::Context;
+
 use crate::depot_downloader::{AuthPromptKind, ProcessEvent};
 
 use super::RootView;
 
 impl RootView {
-    pub(super) fn apply_process_event(&mut self, event: ProcessEvent) {
+    pub(super) fn apply_process_event(&mut self, event: ProcessEvent, cx: &mut Context<Self>) {
         match event {
             ProcessEvent::FailedToStart(message) => {
                 self.run_state = super::RunState::Failed(message);
@@ -27,12 +29,19 @@ impl RootView {
                     | super::RunState::ShowingQrCode { .. }
                     | super::RunState::AwaitingSteamGuardCode { .. }
                     | super::RunState::AwaitingSteamGuardConfirmation => {
-                        self.run_state = super::RunState::Failed(describe_unexpected_exit(status));
+                        self.handle_unexpected_failure(describe_unexpected_exit(status), cx);
                     }
                     _ => {}
                 },
             },
             ProcessEvent::Stats(stats) => {
+                if self.last_disk_phase.is_some() && self.last_disk_phase != stats.disk_phase {
+                    self.speed_history.clear();
+                }
+                self.last_disk_phase = stats.disk_phase;
+                self.speed_history
+                    .push(stats.download_speed_bytes_per_sec, stats.disk_speed_bytes_per_sec);
+
                 // Only a successful login reports a username, so a bad
                 // password or rejected QR scan can never poison the remembered
                 // account.
@@ -42,14 +51,23 @@ impl RootView {
                     self.config.logged_in_username = Some(username.clone());
                     self.config.save();
                 }
+                // A login succeeding - including a retry's reconnect - means
+                // whatever dropped the connection before is behind us, so a
+                // later unrelated drop gets its own full retry budget.
+                if stats.logged_in_username.is_some() {
+                    self.retry_count = 0;
+                }
                 if stats.login_expired {
                     self.config.logged_in_username = None;
                     self.config.save();
                 }
 
-                self.run_state = if let Some(message) = stats.error_message {
-                    super::RunState::Failed(message)
-                } else if let Some(url) = stats.qr_url {
+                if let Some(message) = stats.error_message {
+                    self.handle_unexpected_failure(message, cx);
+                    return;
+                }
+
+                self.run_state = if let Some(url) = stats.qr_url {
                     super::RunState::ShowingQrCode { url }
                 } else if let Some(prompt) = stats.auth_prompt {
                     match prompt.kind {

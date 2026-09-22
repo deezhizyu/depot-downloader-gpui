@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use gpui_kit::base::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::Input;
@@ -10,6 +12,9 @@ use crate::ui::{format_bytes, format_eta, format_speed};
 
 use super::RootView;
 use super::qr_code::render_qr_code;
+use super::session::MAX_RETRIES;
+use super::speed_chart::SpeedChart;
+use super::speed_history::SpeedHistory;
 use super::state::{PendingControl, RunState};
 
 impl RootView {
@@ -29,18 +34,37 @@ impl RootView {
             RunState::AwaitingSteamGuardConfirmation => {
                 status_line("Confirm this sign-in in the Steam Mobile app…", cx)
             }
+            RunState::Reconnecting { attempt } => status_line(
+                &format!("Lost connection to Steam. Reconnecting… (attempt {attempt} of {MAX_RETRIES})"),
+                cx,
+            ),
             RunState::Running(stats) => v_flex()
                 .gap_3()
-                .child(render_progress(stats, cx))
+                .child(render_progress(
+                    stats,
+                    &self.speed_history,
+                    self.speed_chart_hover_anchor,
+                    cx,
+                ))
                 .child(self.render_running_controls(cx))
                 .into_any_element(),
             RunState::Paused(stats) => v_flex()
                 .gap_3()
-                .child(render_progress(stats, cx))
+                .child(render_progress(
+                    stats,
+                    &self.speed_history,
+                    self.speed_chart_hover_anchor,
+                    cx,
+                ))
                 .child(self.render_paused_controls(cx))
                 .into_any_element(),
             RunState::Finished(stats) => {
-                let progress = render_progress(stats, cx);
+                let progress = render_progress(
+                    stats,
+                    &self.speed_history,
+                    self.speed_chart_hover_anchor,
+                    cx,
+                );
                 if self.steam_library_manifest_written {
                     v_flex()
                         .gap_3()
@@ -154,8 +178,14 @@ fn status_line(message: &str, cx: &mut Context<RootView>) -> AnyElement {
         .into_any_element()
 }
 
-fn render_progress(stats: &DownloadStats, cx: &App) -> AnyElement {
+fn render_progress(
+    stats: &DownloadStats,
+    speed_history: &SpeedHistory,
+    hover_anchor: Option<Instant>,
+    cx: &mut Context<RootView>,
+) -> AnyElement {
     let is_verifying = stats.disk_phase == Some(DiskPhase::Verifying);
+    let chart_now = hover_anchor.unwrap_or_else(Instant::now);
 
     let mut column = v_flex()
         .gap_2()
@@ -169,6 +199,23 @@ fn render_progress(stats: &DownloadStats, cx: &App) -> AnyElement {
                 .border_color(cx.theme().input)
                 .bg(cx.theme().input_background())
                 .child(stats.status_message.clone()),
+        )
+        .child(
+            div()
+                .id("speed-chart-wrapper")
+                .h(px(96.0))
+                .w_full()
+                .on_hover(cx.listener(|view, hovered: &bool, _, cx| {
+                    view.speed_chart_hover_anchor = hovered.then(Instant::now);
+                    cx.notify();
+                }))
+                .child(
+                    SpeedChart::new(speed_history, chart_now)
+                        .id("speed-chart")
+                        .download_stroke(cx.theme().colors.blue)
+                        .disk_stroke(cx.theme().colors.green)
+                        .show_download(!is_verifying),
+                ),
         )
         .child(Progress::new("download-progress").value(stats.percent_complete() as f32))
         .child(

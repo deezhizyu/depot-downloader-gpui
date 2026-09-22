@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui_kit::*;
 
@@ -9,6 +10,13 @@ use crate::steam;
 
 use super::RootView;
 use super::state::{LoginMode, PendingControl, PendingLibraryManifest, RunState};
+
+/// How many times an unexpected exit (a dropped Steam connection is the
+/// common cause) is retried before giving up and showing `RunState::Failed`.
+pub(super) const MAX_RETRIES: u32 = 3;
+/// Wait before a retry: DepotDownloader's own internal reconnect can still be
+/// unwinding right after the exit, and Steam itself may need a moment.
+const RETRY_DELAY: Duration = Duration::from_secs(3);
 
 impl RootView {
     pub(super) fn start_provisioning(&self, cx: &mut Context<Self>) {
@@ -87,6 +95,10 @@ impl RootView {
 
         let add_to_steam_library = self.add_to_steam_library;
 
+        self.speed_history.clear();
+        self.speed_chart_hover_anchor = None;
+        self.last_disk_phase = None;
+        self.retry_count = 0;
         self.run_state = RunState::LookingUpApp;
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -163,7 +175,7 @@ impl RootView {
         cx.spawn(async move |this, cx| {
             while let Ok(event) = update_rx.recv().await {
                 let updated = this.update(cx, |view, cx| {
-                    view.apply_process_event(event);
+                    view.apply_process_event(event, cx);
                     cx.notify();
                 });
                 if updated.is_err() {
@@ -174,6 +186,45 @@ impl RootView {
         .detach();
 
         cx.notify();
+    }
+
+    /// Handles DepotDownloader exiting on its own without finishing (a
+    /// dropped Steam connection is the common cause): retries by relaunching
+    /// with the remembered login up to `MAX_RETRIES` times before settling on
+    /// `RunState::Failed`. Only possible once a login has actually succeeded,
+    /// since only then is there a remembered username and a `last_request`
+    /// to relaunch.
+    pub(super) fn handle_unexpected_failure(&mut self, reason: String, cx: &mut Context<Self>) {
+        let can_retry = self.retry_count < MAX_RETRIES
+            && self.last_request.is_some()
+            && self.config.logged_in_username.is_some();
+
+        if !can_retry {
+            let attempts = self.retry_count;
+            self.run_state = RunState::Failed(if attempts > 0 {
+                format!("{reason} (gave up after {attempts} retries.)")
+            } else {
+                reason
+            });
+            cx.notify();
+            return;
+        }
+
+        self.retry_count += 1;
+        self.run_state = RunState::Reconnecting {
+            attempt: self.retry_count,
+        };
+        cx.notify();
+        eprintln!(
+            "[depot-downloader-gpui] {reason} - retrying ({} of {MAX_RETRIES})",
+            self.retry_count
+        );
+
+        cx.spawn(async move |this, cx| {
+            smol::Timer::after(RETRY_DELAY).await;
+            let _ = this.update(cx, |view, cx| view.resume_download(cx));
+        })
+        .detach();
     }
 
     fn send_control_signal(&self) {

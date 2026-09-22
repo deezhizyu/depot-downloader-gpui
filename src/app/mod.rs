@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme, Root, TitleBar, h_flex, v_flex};
@@ -6,16 +7,19 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use crate::config::Config;
-use crate::depot_downloader::DownloadRequest;
+use crate::depot_downloader::{DiskPhase, DownloadRequest};
 use crate::steam;
 
 mod form;
 mod process_events;
 mod qr_code;
 mod session;
+mod speed_chart;
+mod speed_history;
 mod state;
 mod status;
 
+use speed_history::SpeedHistory;
 use state::{LoginMode, PendingControl, PendingLibraryManifest, RunState};
 
 pub struct RootView {
@@ -33,6 +37,16 @@ pub struct RootView {
     add_to_steam_library: bool,
     depot_downloader_binary: Option<PathBuf>,
     run_state: RunState,
+    speed_history: SpeedHistory,
+    /// Set while the pointer is over the speed chart, to the instant hovering
+    /// began: freezes the chart's scroll at that instant so the tooltip's
+    /// values stay put under a stationary cursor, while samples keep
+    /// accumulating in `speed_history` in the background.
+    speed_chart_hover_anchor: Option<Instant>,
+    /// The last `DownloadStats::disk_phase` seen, so `apply_process_event` can
+    /// clear `speed_history` the moment it changes: validate and download
+    /// speeds aren't comparable, so a graph spanning both is meaningless.
+    last_disk_phase: Option<DiskPhase>,
     respond_sender: Option<async_channel::Sender<String>>,
     cancel_sender: Option<async_channel::Sender<()>>,
     pending_control: Option<PendingControl>,
@@ -40,6 +54,10 @@ pub struct RootView {
     /// `resume_download` can relaunch it without asking the user to fill the
     /// form in again.
     last_request: Option<DownloadRequest>,
+    /// How many automatic reconnect attempts have been made since the last
+    /// successful login; reset on a fresh `start_download` and on every
+    /// `login_success`, so a later unrelated drop gets its own full budget.
+    retry_count: u32,
     /// Set when `add_to_steam_library` was on at launch and the library
     /// folder qualified; consumed the moment the download finishes.
     library_manifest: Option<PendingLibraryManifest>,
@@ -111,10 +129,14 @@ impl RootView {
             add_to_steam_library: true,
             depot_downloader_binary: None,
             run_state: RunState::PreparingDepotDownloader,
+            speed_history: SpeedHistory::default(),
+            speed_chart_hover_anchor: None,
+            last_disk_phase: None,
             respond_sender: None,
             cancel_sender: None,
             pending_control: None,
             last_request: None,
+            retry_count: 0,
             library_manifest: None,
             steam_library_manifest_written: false,
         };

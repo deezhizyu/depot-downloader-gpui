@@ -16,7 +16,7 @@ fn main() {
         theme::install(cx);
 
         let window_options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(880.0), px(500.0)), cx)),
+            window_bounds: Some(WindowBounds::centered(size(px(880.0), px(520.0)), cx)),
             ..TitleBar::window_options()
         };
 
