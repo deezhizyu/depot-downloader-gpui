@@ -114,6 +114,13 @@ fork that adds a `-json` output mode: exact cumulative byte counters, a
 events, and the raw QR login URL — everything this GUI's progress view is
 built on.
 
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. Forking or redistributing this
+project requires keeping one of these license files and their copyright
+notice with your copy.
+
 ## Credits
 
 - [DepotDownloader](https://github.com/SteamRE/DepotDownloader) by the SteamRE
