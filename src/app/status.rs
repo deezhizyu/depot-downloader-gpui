@@ -9,7 +9,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use crate::depot_downloader::{DiskPhase, DownloadStats};
-use crate::ui::{format_bytes, format_eta, format_speed};
+use crate::ui::{format_bytes, format_elapsed, format_eta, format_speed};
 
 use super::RootView;
 use super::qr_code::render_qr_code;
@@ -240,6 +240,7 @@ fn render_progress(
             h_flex()
                 .justify_between()
                 .child(format!("Progress: {:.1}%", stats.percent_complete()))
+                .child(format!("Elapsed: {}", format_elapsed(stats.elapsed)))
                 .child(format!("ETA: {}", format_eta(stats.eta))),
         );
 

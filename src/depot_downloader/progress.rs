@@ -46,6 +46,9 @@ pub struct DownloadStats {
     pub download_speed_bytes_per_sec: f64,
     pub disk_speed_bytes_per_sec: f64,
     pub eta: Option<Duration>,
+    /// Wall-clock time since this DepotDownloader process started (its own
+    /// `t_ms`, including login) - not just since bytes started flowing.
+    pub elapsed: Duration,
     pub auth_prompt: Option<AuthPrompt>,
     pub qr_url: Option<String>,
     pub error_message: Option<String>,
@@ -122,6 +125,7 @@ impl ProgressTracker {
     pub fn apply(&mut self, line: EventLine, received_at: Instant) {
         self.latest_t_ms = line.t_ms;
         self.latest_received_at = received_at;
+        self.stats.elapsed = Duration::from_millis(self.latest_t_ms);
         match line.event {
             Event::AuthPrompt { kind, message } => self.apply_auth_prompt(kind, message),
             Event::Qr { url } => self.stats.qr_url = Some(url),
@@ -144,12 +148,15 @@ impl ProgressTracker {
         let before = (
             self.stats.download_speed_bytes_per_sec,
             self.stats.disk_speed_bytes_per_sec,
+            self.stats.elapsed.as_secs(),
         );
+        self.stats.elapsed = Duration::from_millis(now_ms);
         self.update_speeds(now_ms);
         before
             != (
                 self.stats.download_speed_bytes_per_sec,
                 self.stats.disk_speed_bytes_per_sec,
+                self.stats.elapsed.as_secs(),
             )
     }
 

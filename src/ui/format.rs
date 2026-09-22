@@ -38,6 +38,21 @@ pub fn format_eta(eta: Option<Duration>) -> String {
     }
 }
 
+/// Fixed-width elapsed time (`1:02:03` or `2:03`), unlike `format_eta`'s
+/// rounded-to-the-largest-unit style - an elapsed counter is expected to
+/// tick every second, so it always shows seconds.
+pub fn format_elapsed(elapsed: Duration) -> String {
+    let total_seconds = elapsed.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,5 +71,12 @@ mod tests {
         assert_eq!(format_eta(Some(Duration::from_secs(45))), "45s");
         assert_eq!(format_eta(Some(Duration::from_secs(125))), "2m 5s");
         assert_eq!(format_eta(Some(Duration::from_secs(3700))), "1h 1m");
+    }
+
+    #[test]
+    fn elapsed_always_shows_seconds() {
+        assert_eq!(format_elapsed(Duration::from_secs(45)), "0:45");
+        assert_eq!(format_elapsed(Duration::from_secs(125)), "2:05");
+        assert_eq!(format_elapsed(Duration::from_secs(3700)), "1:01:40");
     }
 }
