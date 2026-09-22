@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+
+use crate::depot_downloader::BranchInfo;
 
 /// Settings persisted between launches: what the user typed last time and
 /// the remembered login.
@@ -17,6 +20,10 @@ pub struct Config {
     /// `depot_downloader::process::LoginMethod::RememberedUsername`), or `None`
     /// if the user hasn't logged in yet or has logged out.
     pub logged_in_username: Option<String>,
+    /// The last `-list-branches` result seen for each app id, so
+    /// `on_game_selected` (`app/session.rs`) can show branches instantly on
+    /// re-selection instead of waiting on a fresh DepotDownloader login.
+    pub branch_cache: HashMap<u64, Vec<BranchInfo>>,
 }
 
 impl Config {

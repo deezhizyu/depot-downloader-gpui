@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// One line of the fork's `-json` stdout (see the fork's `docs/json-mode.md`).
 /// `t_ms` is the fork's own monotonic clock, so speeds stay correct even when
@@ -82,7 +82,7 @@ impl SteamApp {
 }
 
 /// One entry of a `-list-branches` result.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchInfo {
     pub name: String,
     pub build_id: u64,

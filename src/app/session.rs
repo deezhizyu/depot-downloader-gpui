@@ -334,6 +334,16 @@ impl RootView {
             return;
         };
         self.selected_app = Some(app);
+        // A cached `-list-branches` result (see `Config::branch_cache`) shows
+        // instantly and skips the network round trip entirely - DepotDownloader
+        // treats every list-branches call as its own fresh Steam login, so on
+        // a repeat selection this is the difference between an instant
+        // dropdown and several seconds queued behind whatever other
+        // credentialed run currently holds the account lock.
+        let cached_branches = self.config.branch_cache.get(&app_id).cloned();
+        if let Some(branches) = cached_branches.clone() {
+            self.set_branch_items(branches, window, cx);
+        }
         cx.notify();
 
         let Some(binary) = self.depot_downloader_binary.clone() else {
@@ -345,7 +355,7 @@ impl RootView {
         let lock_rx = self.credentialed_lock_rx.clone();
         let owned_dlc_ids = self.owned_dlc_ids();
         self.dlc_loading = true;
-        self.branches_loading = true;
+        self.branches_loading = cached_branches.is_none();
         cx.notify();
 
         cx.spawn_in(window, async move |this, cx| {
@@ -380,23 +390,29 @@ impl RootView {
         })
         .detach();
 
-        cx.spawn_in(window, async move |this, cx| {
-            let branches = cx
-                .background_executor()
-                .spawn(run_credentialed(
-                    is_anonymous,
-                    lock_tx,
-                    lock_rx,
-                    depot_downloader::run_list_branches(binary, app_id, login),
-                ))
-                .await;
-            let _ = this.update_in(cx, |view, window, cx| {
-                view.set_branch_items(branches.unwrap_or_default(), window, cx);
-                view.branches_loading = false;
-                cx.notify();
-            });
-        })
-        .detach();
+        if cached_branches.is_none() {
+            cx.spawn_in(window, async move |this, cx| {
+                let branches = cx
+                    .background_executor()
+                    .spawn(run_credentialed(
+                        is_anonymous,
+                        lock_tx,
+                        lock_rx,
+                        depot_downloader::run_list_branches(binary, app_id, login),
+                    ))
+                    .await;
+                let _ = this.update_in(cx, |view, window, cx| {
+                    if let Some(branches) = &branches {
+                        view.config.branch_cache.insert(app_id, branches.clone());
+                        view.config.save();
+                    }
+                    view.set_branch_items(branches.unwrap_or_default(), window, cx);
+                    view.branches_loading = false;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     fn set_dlc_items(&mut self, items: Vec<DlcItem>, window: &mut Window, cx: &mut Context<Self>) {
