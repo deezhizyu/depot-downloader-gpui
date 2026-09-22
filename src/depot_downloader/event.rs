@@ -51,8 +51,43 @@ pub enum Event {
     Error {
         message: String,
     },
+    UserApps {
+        apps: Vec<SteamApp>,
+        count: u64,
+    },
+    Branches {
+        app_id: u64,
+        branches: Vec<BranchInfo>,
+    },
     #[serde(other)]
     Ignored,
+}
+
+/// One entry of a `-list-user-apps` result: an app id, name, and Steam app
+/// type (`Game`, `DLC`, `Tool`, `Demo`, `Application`, ...) the account's
+/// licenses grant. `#[serde(default)]` tolerates a provisioned binary older
+/// than the fork's `-app-type` addition, which omitted `type` entirely.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SteamApp {
+    pub app_id: u64,
+    pub name: String,
+    #[serde(rename = "type", default)]
+    pub app_type: String,
+}
+
+impl SteamApp {
+    pub fn is_type(&self, app_type: &str) -> bool {
+        self.app_type.eq_ignore_ascii_case(app_type)
+    }
+}
+
+/// One entry of a `-list-branches` result.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BranchInfo {
+    pub name: String,
+    pub build_id: u64,
+    pub time_updated: u64,
+    pub password_required: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -116,6 +151,34 @@ mod tests {
         assert!(matches!(
             login.event,
             Event::LoginSuccess { username: None }
+        ));
+    }
+
+    #[test]
+    fn parses_user_apps_and_branches() {
+        let line = parse(
+            r#"{"event":"user_apps","t_ms":5,"apps":[{"app_id":730,"name":"Counter-Strike 2","type":"Game"}],"count":1}"#,
+        );
+        assert!(matches!(
+            line.event,
+            Event::UserApps { ref apps, count: 1 }
+                if apps.len() == 1 && apps[0].app_id == 730 && apps[0].is_type("game")
+        ));
+
+        let line = parse(
+            r#"{"event":"user_apps","t_ms":5,"apps":[{"app_id":730,"name":"Counter-Strike 2"}],"count":1}"#,
+        );
+        assert!(matches!(
+            line.event,
+            Event::UserApps { ref apps, .. } if apps[0].app_type.is_empty()
+        ));
+
+        let line = parse(
+            r#"{"event":"branches","t_ms":6,"app_id":730,"branches":[{"name":"public","build_id":1,"time_updated":2,"password_required":false}]}"#,
+        );
+        assert!(matches!(
+            line.event,
+            Event::Branches { app_id: 730, ref branches } if branches.len() == 1 && branches[0].name == "public"
         ));
     }
 

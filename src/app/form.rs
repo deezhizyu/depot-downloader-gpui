@@ -1,7 +1,9 @@
 use gpui_kit::base::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::combobox::Combobox;
 use gpui_kit::component::input::Input;
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -9,7 +11,7 @@ use gpui_kit::*;
 use crate::steam;
 
 use super::RootView;
-use super::state::{LoginMode, RunState};
+use super::state::LoginMode;
 
 impl RootView {
     fn browse_for_download_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -54,6 +56,7 @@ impl RootView {
     ) -> impl IntoElement {
         let button = Button::new(id)
             .label(label)
+            .disabled(self.is_busy())
             .on_click(cx.listener(move |view, _, _, cx| {
                 view.login_mode = mode;
                 cx.notify();
@@ -66,14 +69,21 @@ impl RootView {
     }
 
     /// Shows "Logged in as X" + a Logout button when a remembered login
-    /// exists, instead of the login-mode toggle and username/password/QR
-    /// fields - there's nothing left for the user to fill in.
+    /// exists, instead of the login-mode toggle, username/password/QR
+    /// fields and Log In button - there's nothing left for the user to do.
     pub(super) fn render_login_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(username) = self.config.logged_in_username.clone() else {
             return v_flex()
                 .gap_3()
                 .child(self.render_login_mode_toggle(cx))
                 .child(self.render_login_fields(cx))
+                .child(
+                    Button::new("log-in")
+                        .primary()
+                        .label("Log In")
+                        .disabled(self.is_busy())
+                        .on_click(cx.listener(|view, _, window, cx| view.log_in(window, cx))),
+                )
                 .into_any_element();
         };
         h_flex()
@@ -84,7 +94,8 @@ impl RootView {
                 Button::new("logout")
                     .secondary()
                     .label("Logout")
-                    .on_click(cx.listener(|view, _, _, cx| view.logout(cx))),
+                    .disabled(self.is_busy())
+                    .on_click(cx.listener(|view, _, window, cx| view.logout(window, cx))),
             )
             .into_any_element()
     }
@@ -100,33 +111,59 @@ impl RootView {
                 .text_color(cx.theme().colors.muted_foreground)
                 .child(
                     "A QR code to scan with the Steam Mobile app will appear below once you \
-                     start the download.",
+                     click Log In.",
                 )
                 .into_any_element(),
         }
     }
 
     pub(super) fn render_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_busy = matches!(
-            self.run_state,
-            RunState::PreparingDepotDownloader
-                | RunState::LookingUpApp
-                | RunState::Running(_)
-                | RunState::Paused(_)
-        );
-        let download_button_label = match self.run_state {
-            RunState::PreparingDepotDownloader | RunState::LookingUpApp | RunState::Running(_) => {
-                "Working…"
-            }
-            RunState::Paused(_) => "Paused",
-            _ => "Download",
+        let is_busy = self.is_busy();
+        let download_button_label = if matches!(self.run_state, super::RunState::Paused(_)) {
+            "Paused"
+        } else if is_busy {
+            "Working…"
+        } else {
+            "Download"
         };
-        v_flex()
+
+        let mut column = v_flex()
             .gap_3()
             .child(labeled_field(
-                "Steam app ID",
-                Input::new(&self.app_id_input),
-            ))
+                "Game",
+                Combobox::new(&self.game_combobox)
+                    .search_placeholder("Search by name or app id")
+                    .placeholder("Choose a game")
+                    .cleanable(true)
+                    .disabled(is_busy)
+                    .w_full(),
+            ));
+
+        if self.selected_app.is_some() {
+            if self.dlc_loading {
+                column = column.child(labeled_field("DLC", loading_row("Checking for DLC…", cx)));
+            } else if self.dlc_available {
+                column = column.child(labeled_field(
+                    "DLC",
+                    Combobox::new(&self.dlc_combobox)
+                        .placeholder("No DLC selected")
+                        .cleanable(true)
+                        .disabled(is_busy)
+                        .w_full(),
+                ));
+            }
+            column = column.child(labeled_field(
+                "Branch",
+                v_flex()
+                    .gap_1()
+                    .child(Combobox::new(&self.branch_combobox).disabled(is_busy).w_full())
+                    .when(self.branches_loading, |branch| {
+                        branch.child(loading_row("Loading branches…", cx))
+                    }),
+            ));
+        }
+
+        column
             .child(labeled_field(
                 "Library folder (game installs in its own subfolder)",
                 h_flex()
@@ -164,7 +201,7 @@ impl RootView {
                 Button::new("start-download")
                     .primary()
                     .label(download_button_label)
-                    .disabled(is_busy)
+                    .disabled(is_busy || self.selected_app.is_none())
                     .on_click(cx.listener(|view, _, _, cx| view.start_download(cx))),
             )
     }
@@ -172,4 +209,17 @@ impl RootView {
 
 fn labeled_field(label: &'static str, field: impl IntoElement) -> impl IntoElement {
     v_flex().gap_1().child(label).child(field)
+}
+
+/// A small spinner + message, for a background fetch (DLC/branch lookup)
+/// that's still running - without this the field it belongs to either shows
+/// nothing yet or, for branches, a `"public"` placeholder indistinguishable
+/// from the real (possibly longer) result still on the way.
+fn loading_row(message: &'static str, cx: &App) -> impl IntoElement {
+    h_flex()
+        .gap_2()
+        .items_center()
+        .text_color(cx.theme().colors.muted_foreground)
+        .child(Spinner::new())
+        .child(message)
 }

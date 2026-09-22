@@ -5,6 +5,7 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::{ActiveTheme, WindowExt, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use crate::depot_downloader::{DiskPhase, DownloadStats};
@@ -22,6 +23,7 @@ impl RootView {
         match &self.run_state {
             RunState::PreparingDepotDownloader => status_line("Setting up DepotDownloader…", cx),
             RunState::LookingUpApp => status_line("Looking up app…", cx),
+            RunState::FetchingLibrary => status_line("Signing in…", cx),
             RunState::Idle => status_line("Download progress appears here.", cx),
             RunState::ShowingQrCode { url } => v_flex()
                 .gap_2()
@@ -40,6 +42,9 @@ impl RootView {
             ),
             RunState::Running(stats) => v_flex()
                 .gap_3()
+                .when_some(self.queue_position_label(), |column, label| {
+                    column.child(div().text_color(cx.theme().colors.muted_foreground).child(label))
+                })
                 .child(render_progress(
                     stats,
                     &self.speed_history,
@@ -50,6 +55,9 @@ impl RootView {
                 .into_any_element(),
             RunState::Paused(stats) => v_flex()
                 .gap_3()
+                .when_some(self.queue_position_label(), |column, label| {
+                    column.child(div().text_color(cx.theme().colors.muted_foreground).child(label))
+                })
                 .child(render_progress(
                     stats,
                     &self.speed_history,
@@ -84,6 +92,16 @@ impl RootView {
                 .child(message.clone())
                 .into_any_element(),
         }
+    }
+
+    /// "(2 of 3)" once a download queue (base game + checked DLCs) is more
+    /// than one leg long; `None` for a single-app download.
+    fn queue_position_label(&self) -> Option<String> {
+        if self.download_queue_total <= 1 {
+            return None;
+        }
+        let position = self.download_queue_total - self.download_queue.len();
+        Some(format!("({position} of {})", self.download_queue_total))
     }
 
     fn render_running_controls(&self, cx: &mut Context<Self>) -> AnyElement {

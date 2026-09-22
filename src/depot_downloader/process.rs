@@ -2,10 +2,9 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
-use async_process::{Command, Stdio};
 use futures_lite::StreamExt;
-use futures_lite::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use super::child;
 use super::event::EventLine;
 use super::progress::{DownloadStats, ProgressTracker};
 
@@ -26,6 +25,29 @@ pub enum LoginMethod {
     RememberedUsername {
         username: String,
     },
+    /// No `-username`/`-qr` at all: the anonymous account DepotDownloader
+    /// falls back to. Never prompts.
+    Anonymous,
+}
+
+/// Appends the `-username`/`-password`/`-qr` flags for `login`; shared with
+/// `list::run_list_user_apps`, which needs the exact same login flags but
+/// without `-app`/`-dir`/`-max-downloads`.
+pub(super) fn push_login_args(args: &mut Vec<String>, login: &LoginMethod) {
+    match login {
+        LoginMethod::UsernamePassword { username, password } => {
+            args.push("-username".to_string());
+            args.push(username.clone());
+            args.push("-password".to_string());
+            args.push(password.clone());
+        }
+        LoginMethod::Qr => args.push("-qr".to_string()),
+        LoginMethod::RememberedUsername { username } => {
+            args.push("-username".to_string());
+            args.push(username.clone());
+        }
+        LoginMethod::Anonymous => {}
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +57,9 @@ pub struct DownloadRequest {
     pub download_dir: Option<PathBuf>,
     pub max_downloads: Option<u32>,
     pub login: LoginMethod,
+    /// `-branch <name>`, omitted (falling back to the fork's own `public`
+    /// default) when `None`.
+    pub branch: Option<String>,
 }
 
 impl DownloadRequest {
@@ -59,19 +84,11 @@ impl DownloadRequest {
             args.push("-max-downloads".to_string());
             args.push(max_downloads.to_string());
         }
-        match &self.login {
-            LoginMethod::UsernamePassword { username, password } => {
-                args.push("-username".to_string());
-                args.push(username.clone());
-                args.push("-password".to_string());
-                args.push(password.clone());
-            }
-            LoginMethod::Qr => args.push("-qr".to_string()),
-            LoginMethod::RememberedUsername { username } => {
-                args.push("-username".to_string());
-                args.push(username.clone());
-            }
+        if let Some(branch) = &self.branch {
+            args.push("-branch".to_string());
+            args.push(branch.clone());
         }
+        push_login_args(&mut args, &self.login);
         args
     }
 
@@ -128,29 +145,18 @@ pub async fn run(
         request.build_args_for_logging().join(" ")
     );
 
-    let mut command = Command::new(&request.depot_downloader_binary);
-    command
-        .args(request.build_args())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
     // The remembered-login token itself (account.config) is unaffected by
-    // this - DepotDownloader stores it via .NET's per-user IsolatedStorage,
-    // keyed by the assembly, not by any real filesystem path. But without
-    // `-dir`, DepotDownloader falls back to a "depots" folder relative to
-    // its own current working directory - which defaults to whatever
-    // directory the GUI happened to be launched from otherwise, and it also
-    // keeps its ".DepotDownloader" manifest/staging cache alongside that
-    // same install directory. Pinning it to the binary's own install
-    // directory (already a stable, writable location - see
-    // `provisioning::install_dir`) keeps both predictable regardless of how
-    // the user starts the app.
-    if let Some(install_dir) = request.depot_downloader_binary.parent() {
-        command.current_dir(install_dir);
-    }
-
-    let mut child = match command.spawn() {
+    // `current_dir` - DepotDownloader stores it via .NET's per-user
+    // IsolatedStorage, keyed by the assembly, not by any real filesystem
+    // path. But without `-dir`, DepotDownloader falls back to a "depots"
+    // folder relative to its own current working directory - which defaults
+    // to whatever directory the GUI happened to be launched from otherwise,
+    // and it also keeps its ".DepotDownloader" manifest/staging cache
+    // alongside that same install directory. `child::spawn` pins it to the
+    // binary's own install directory (already a stable, writable location -
+    // see `provisioning::install_dir`) so both stay predictable regardless
+    // of how the user starts the app.
+    let mut child = match child::spawn(&request.depot_downloader_binary, request.build_args()) {
         Ok(child) => child,
         Err(error) => {
             eprintln!("[depot-downloader-gpui] failed to launch DepotDownloader: {error}");
@@ -163,23 +169,8 @@ pub async fn run(
         }
     };
 
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-    let mut stdin = child.stdin.take().expect("stdin was piped");
-
-    let (line_tx, line_rx) = async_channel::unbounded::<String>();
-    smol::spawn(forward_lines(stdout, line_tx.clone())).detach();
-    smol::spawn(forward_lines(stderr, line_tx.clone())).detach();
-    drop(line_tx);
-
-    smol::spawn(async move {
-        while let Ok(line) = respond.recv().await {
-            let _ = stdin.write_all(line.as_bytes()).await;
-            let _ = stdin.write_all(b"\n").await;
-            let _ = stdin.flush().await;
-        }
-    })
-    .detach();
+    let line_rx = child::stream_output(&mut child);
+    child::forward_stdin(&mut child, respond);
 
     let mut tracker = ProgressTracker::new();
     let mut speed_refresh = smol::Timer::interval(SPEED_REFRESH_INTERVAL);
@@ -257,36 +248,4 @@ async fn next_sample(
         futures_lite::future::or(refresh_due, next_line),
     )
     .await
-}
-
-/// Reads raw bytes and splits on `\n` ourselves, rather than using
-/// `AsyncBufReadExt::lines()`, because that adapter silently ends the whole
-/// stream the moment one line fails strict UTF-8 decoding - and DepotDownloader's
-/// QR code block is exactly the kind of output most likely to hit an encoding
-/// edge case on some platforms. `from_utf8_lossy` never fails, so one malformed
-/// line can never take down the rest of the read loop with it.
-async fn forward_lines(
-    reader: impl futures_lite::AsyncRead + Unpin,
-    sink: async_channel::Sender<String>,
-) {
-    let mut reader = BufReader::new(reader);
-    let mut raw_line = Vec::new();
-    loop {
-        raw_line.clear();
-        match reader.read_until(b'\n', &mut raw_line).await {
-            Ok(0) => break,
-            Ok(_) => {
-                let line = String::from_utf8_lossy(&raw_line);
-                let line = line.trim_end_matches(['\r', '\n']);
-                eprintln!("[DepotDownloader] {line}");
-                if sink.send(line.to_string()).await.is_err() {
-                    break;
-                }
-            }
-            Err(error) => {
-                eprintln!("[depot-downloader-gpui] error reading DepotDownloader output: {error}");
-                break;
-            }
-        }
-    }
 }

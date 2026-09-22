@@ -218,7 +218,11 @@ impl ProgressTracker {
                 self.stats.is_finished = true;
             }
             Event::Error { message } => self.stats.error_message = Some(message),
-            Event::AuthPrompt { .. } | Event::Qr { .. } | Event::Ignored => {}
+            Event::AuthPrompt { .. }
+            | Event::Qr { .. }
+            | Event::UserApps { .. }
+            | Event::Branches { .. }
+            | Event::Ignored => {}
         }
     }
 

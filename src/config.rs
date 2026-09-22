@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub last_app_id: String,
+    /// The last selected game's app id, so the game dropdown can try to
+    /// re-select it once the catalog loads.
+    pub last_app_id: Option<u64>,
     pub last_download_location: Option<PathBuf>,
     pub last_max_downloads: String,
     /// The Steam account name of a remembered login (see

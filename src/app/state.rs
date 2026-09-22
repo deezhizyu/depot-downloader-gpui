@@ -24,6 +24,13 @@ pub(super) enum RunState {
     /// install folder and sizes are being looked up. No process exists yet, so
     /// there is nothing for Pause/Cancel to act on.
     LookingUpApp,
+    /// A `-list-user-apps` run is underway (see `session::fetch_user_apps`)
+    /// and hasn't hit a login prompt yet. `ShowingQrCode`/
+    /// `AwaitingSteamGuardCode`/`AwaitingSteamGuardConfirmation` below are
+    /// shared with the download flow - nothing about them is download-
+    /// specific - so a login prompt during this fetch reuses them as-is;
+    /// `pending_action` on `RootView` says what happens once they resolve.
+    FetchingLibrary,
     Idle,
     Running(DownloadStats),
     ShowingQrCode {
@@ -56,4 +63,25 @@ pub(super) enum RunState {
 pub(super) enum PendingControl {
     Pausing,
     Cancelling,
+}
+
+/// What the shared login-prompt states (`RunState::ShowingQrCode` etc.) are
+/// presently for, so `submit_guard_code` and the QR/login-success handling
+/// in `process_events.rs` know whether to continue into a download or into
+/// populating the owned-games list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PendingAction {
+    Download,
+    FetchLibrary,
+}
+
+/// The parts of a download queue (base game + checked DLCs) that stay the
+/// same across every leg - only the app id and, after the first leg's
+/// login succeeds, the login method change. Set once in `start_download`
+/// and consumed by `session::launch_queue_leg` for each leg in turn.
+pub(super) struct QueueContext {
+    pub library_dir: Option<std::path::PathBuf>,
+    pub max_downloads: Option<u32>,
+    pub branch: Option<String>,
+    pub add_to_steam_library: bool,
 }
