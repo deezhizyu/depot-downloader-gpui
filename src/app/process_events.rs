@@ -19,7 +19,9 @@ impl RootView {
                 }
                 None => match &self.run_state {
                     super::RunState::Running(stats) if stats.is_finished => {
-                        self.run_state = super::RunState::Finished(stats.clone());
+                        let stats = stats.clone();
+                        self.finish_library_manifest(&stats);
+                        self.run_state = super::RunState::Finished(stats);
                     }
                     super::RunState::Running(_)
                     | super::RunState::ShowingQrCode { .. }
@@ -59,6 +61,7 @@ impl RootView {
                         },
                     }
                 } else if stats.is_finished {
+                    self.finish_library_manifest(&stats);
                     super::RunState::Finished(stats)
                 } else {
                     super::RunState::Running(stats)

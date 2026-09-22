@@ -16,7 +16,7 @@ mod session;
 mod state;
 mod status;
 
-use state::{LoginMode, PendingControl, RunState};
+use state::{LoginMode, PendingControl, PendingLibraryManifest, RunState};
 
 pub struct RootView {
     config: Config,
@@ -27,6 +27,10 @@ pub struct RootView {
     download_dir_input: Entity<InputState>,
     max_downloads_input: Entity<InputState>,
     guard_code_input: Entity<InputState>,
+    /// Whether to write a Steam `appmanifest_*.acf` after a finished
+    /// download; only offered, and only acted on, when the chosen library
+    /// folder is a real `steamapps/common`.
+    add_to_steam_library: bool,
     depot_downloader_binary: Option<PathBuf>,
     run_state: RunState,
     respond_sender: Option<async_channel::Sender<String>>,
@@ -36,6 +40,12 @@ pub struct RootView {
     /// `resume_download` can relaunch it without asking the user to fill the
     /// form in again.
     last_request: Option<DownloadRequest>,
+    /// Set when `add_to_steam_library` was on at launch and the library
+    /// folder qualified; consumed the moment the download finishes.
+    library_manifest: Option<PendingLibraryManifest>,
+    /// Whether the just-finished run wrote a Steam appmanifest, so the
+    /// "Download complete" status can tell the user to restart Steam.
+    steam_library_manifest_written: bool,
 }
 
 impl RootView {
@@ -98,12 +108,15 @@ impl RootView {
             download_dir_input,
             max_downloads_input,
             guard_code_input,
+            add_to_steam_library: true,
             depot_downloader_binary: None,
             run_state: RunState::PreparingDepotDownloader,
             respond_sender: None,
             cancel_sender: None,
             pending_control: None,
             last_request: None,
+            library_manifest: None,
+            steam_library_manifest_written: false,
         };
         view.start_provisioning(cx);
         view
@@ -126,6 +139,10 @@ impl Render for RootView {
             .id("root")
             .size_full()
             .bg(cx.theme().colors.background)
+            // Runs before any child's own mouse-down handler, so a click on
+            // an input still focuses it: this only clears whatever was
+            // focused *before* the click.
+            .capture_any_mouse_down(|_event, window, cx| window.blur(cx))
             .child(TitleBar::new().child("DepotDownloader"))
             .child(
                 h_flex()

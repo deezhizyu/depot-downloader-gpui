@@ -8,7 +8,7 @@ use crate::depot_downloader::{DownloadRequest, DownloadStats, LoginMethod, provi
 use crate::steam;
 
 use super::RootView;
-use super::state::{LoginMode, PendingControl, RunState};
+use super::state::{LoginMode, PendingControl, PendingLibraryManifest, RunState};
 
 impl RootView {
     pub(super) fn start_provisioning(&self, cx: &mut Context<Self>) {
@@ -85,19 +85,30 @@ impl RootView {
         self.config.last_max_downloads = max_downloads_text;
         self.config.save();
 
+        let add_to_steam_library = self.add_to_steam_library;
+
         self.run_state = RunState::LookingUpApp;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let download_dir = match library_dir {
-                Some(dir) => {
+            let (download_dir, library_manifest) = match library_dir {
+                Some(common_dir) => {
                     let lookup_app_id = app_id.clone();
-                    let install_dir_name = cx
+                    let app_info = cx
                         .background_executor()
-                        .spawn(async move { steam::fetch_install_dir_name(&lookup_app_id) })
+                        .spawn(async move { steam::fetch_app_info(&lookup_app_id) })
                         .await;
-                    Some(dir.join(install_dir_name))
+                    let download_dir = common_dir.join(&app_info.install_dir_name);
+                    let library_manifest = (add_to_steam_library
+                        && steam::is_steam_library_common_dir(&common_dir))
+                    .then(|| common_dir.parent().map(|steamapps_dir| PendingLibraryManifest {
+                        steamapps_dir: steamapps_dir.to_path_buf(),
+                        app_id: app_id.clone(),
+                        app_info,
+                    }))
+                    .flatten();
+                    (Some(download_dir), library_manifest)
                 }
-                None => None,
+                None => (None, None),
             };
             let request = DownloadRequest {
                 depot_downloader_binary: binary,
@@ -106,7 +117,10 @@ impl RootView {
                 max_downloads,
                 login,
             };
-            let _ = this.update(cx, |view, cx| view.launch(request, cx));
+            let _ = this.update(cx, |view, cx| {
+                view.library_manifest = library_manifest;
+                view.launch(request, cx);
+            });
         })
         .detach();
     }
@@ -202,6 +216,30 @@ impl RootView {
             let _ = std::fs::remove_file(install_dir.join("account.config"));
         }
         cx.notify();
+    }
+
+    /// Writes the Steam appmanifest for the download that just finished, if
+    /// `add_to_steam_library` was on at launch. Best-effort: a failure here
+    /// leaves the completed download itself untouched, so it only goes to
+    /// the console rather than the UI.
+    pub(super) fn finish_library_manifest(&mut self, stats: &DownloadStats) {
+        self.steam_library_manifest_written = false;
+        let Some(pending) = self.library_manifest.take() else {
+            return;
+        };
+        match steam::write_app_manifest(
+            &pending.steamapps_dir,
+            &pending.app_id,
+            &pending.app_info,
+            stats.total_uncompressed_bytes,
+            &stats.depot_ids,
+        ) {
+            Ok(()) => self.steam_library_manifest_written = true,
+            Err(error) => eprintln!(
+                "Could not add app {} to the Steam library: {error}",
+                pending.app_id
+            ),
+        }
     }
 
     pub(super) fn submit_guard_code(&mut self, cx: &mut Context<Self>) {

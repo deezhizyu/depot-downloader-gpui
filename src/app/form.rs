@@ -1,8 +1,12 @@
 use gpui_kit::base::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+
+use crate::steam;
 
 use super::RootView;
 use super::state::{LoginMode, RunState};
@@ -136,6 +140,22 @@ impl RootView {
                             })),
                     ),
             ))
+            .when(
+                steam::is_steam_library_common_dir(std::path::Path::new(
+                    self.download_dir_input.read(cx).value().trim(),
+                )),
+                |column| {
+                    column.child(
+                        Checkbox::new("add-to-steam-library")
+                            .label("Add to Steam library when finished")
+                            .checked(self.add_to_steam_library)
+                            .on_click(cx.listener(|view, checked, _, cx| {
+                                view.add_to_steam_library = *checked;
+                                cx.notify();
+                            })),
+                    )
+                },
+            )
             .child(labeled_field(
                 "Max concurrent downloads (optional)",
                 Input::new(&self.max_downloads_input),

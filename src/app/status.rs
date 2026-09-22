@@ -5,7 +5,7 @@ use gpui_kit::component::progress::Progress;
 use gpui_kit::component::{ActiveTheme, WindowExt, h_flex, v_flex};
 use gpui_kit::*;
 
-use crate::depot_downloader::DownloadStats;
+use crate::depot_downloader::{DiskPhase, DownloadStats};
 use crate::ui::{format_bytes, format_eta, format_speed};
 
 use super::RootView;
@@ -39,7 +39,22 @@ impl RootView {
                 .child(render_progress(stats, cx))
                 .child(self.render_paused_controls(cx))
                 .into_any_element(),
-            RunState::Finished(stats) => render_progress(stats, cx),
+            RunState::Finished(stats) => {
+                let progress = render_progress(stats, cx);
+                if self.steam_library_manifest_written {
+                    v_flex()
+                        .gap_3()
+                        .child(progress)
+                        .child(
+                            div().text_color(cx.theme().colors.muted_foreground).child(
+                                "Restart Steam to see it added to your library.",
+                            ),
+                        )
+                        .into_any_element()
+                } else {
+                    progress
+                }
+            }
             RunState::Failed(message) => div()
                 .text_color(cx.theme().colors.danger)
                 .child(message.clone())
@@ -140,7 +155,9 @@ fn status_line(message: &str, cx: &mut Context<RootView>) -> AnyElement {
 }
 
 fn render_progress(stats: &DownloadStats, cx: &App) -> AnyElement {
-    v_flex()
+    let is_verifying = stats.disk_phase == Some(DiskPhase::Verifying);
+
+    let mut column = v_flex()
         .gap_2()
         .child(
             div()
@@ -159,32 +176,53 @@ fn render_progress(stats: &DownloadStats, cx: &App) -> AnyElement {
                 .justify_between()
                 .child(format!("Progress: {:.1}%", stats.percent_complete()))
                 .child(format!("ETA: {}", format_eta(stats.eta))),
-        )
-        .child(format!(
+        );
+
+    if !is_verifying {
+        column = column.child(format!(
             "Downloaded: {} of {}",
             format_bytes(stats.network_bytes),
             format_bytes(stats.network_total_bytes())
-        ))
+        ));
+    }
+
+    column = column
         .child(format!(
-            "Written to disk: {} of {}",
+            "{}: {} of {}",
+            if is_verifying {
+                "Validated"
+            } else {
+                "Written to disk"
+            },
             format_bytes(stats.completed_uncompressed_bytes()),
             format_bytes(stats.total_uncompressed_bytes)
         ))
         .child(format!(
             "Files: {} of {}",
             stats.files_done, stats.total_files
-        ))
-        .child(
-            h_flex()
-                .justify_between()
-                .child(format!(
-                    "Download: {}",
-                    format_speed(stats.download_speed_bytes_per_sec)
-                ))
-                .child(format!(
-                    "Disk: {}",
-                    format_speed(stats.disk_speed_bytes_per_sec)
-                )),
-        )
-        .into_any_element()
+        ));
+
+    if is_verifying {
+        column
+            .child(format!(
+                "Validate: {}",
+                format_speed(stats.disk_speed_bytes_per_sec)
+            ))
+            .into_any_element()
+    } else {
+        column
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(format!(
+                        "Download: {}",
+                        format_speed(stats.download_speed_bytes_per_sec)
+                    ))
+                    .child(format!(
+                        "Disk: {}",
+                        format_speed(stats.disk_speed_bytes_per_sec)
+                    )),
+            )
+            .into_any_element()
+    }
 }

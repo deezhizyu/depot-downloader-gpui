@@ -1,4 +1,16 @@
+use std::path::PathBuf;
+
 use crate::depot_downloader::DownloadStats;
+use crate::steam::AppInfo;
+
+/// Captured when a download starts, from the library folder and app info
+/// looked up then - so a finished download can write a Steam
+/// `appmanifest_*.acf` without re-deriving anything.
+pub(super) struct PendingLibraryManifest {
+    pub steamapps_dir: PathBuf,
+    pub app_id: String,
+    pub app_info: AppInfo,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum LoginMode {

@@ -5,4 +5,4 @@ pub mod provisioning;
 
 pub use event::AuthPromptKind;
 pub use process::{DownloadRequest, LoginMethod, ProcessEvent};
-pub use progress::DownloadStats;
+pub use progress::{DiskPhase, DownloadStats};

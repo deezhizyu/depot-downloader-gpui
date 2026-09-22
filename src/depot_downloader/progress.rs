@@ -6,6 +6,19 @@ use super::event::{AuthPromptKind, Event, EventLine, LogLevel};
 /// Speeds are the counter growth across this much of the most recent time.
 const SPEED_WINDOW_MS: u64 = 1000;
 const ETA_SMOOTHING_SECS: f64 = 10.0;
+/// Below this much elapsed time between the window's oldest and newest sample,
+/// a single sample dominates the rate and can swing wildly; ETA stays hidden.
+const MIN_SPEED_SAMPLE_SPAN_MS: u64 = 500;
+
+/// Which disk counter is presently advancing. Verifying (reading existing
+/// files against the manifest) and writing (real network-bound download) run
+/// at very different rates, so a rate average must not blend across the
+/// switch between them, and the UI shows different numbers for each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskPhase {
+    Verifying,
+    Writing,
+}
 
 #[derive(Debug, Clone)]
 pub struct AuthPrompt {
@@ -19,6 +32,10 @@ pub struct DownloadStats {
     pub total_compressed_bytes: u64,
     pub total_uncompressed_bytes: u64,
     pub total_files: u64,
+    /// Every depot id seen this run, in the order DepotDownloader started
+    /// them - not what's on disk, but enough to write a Steam appmanifest's
+    /// `InstalledDepots` once matched against their published manifest ids.
+    pub depot_ids: Vec<u64>,
     /// Compressed bytes received from Steam this run.
     pub network_bytes: u64,
     /// Uncompressed bytes written to disk this run.
@@ -36,6 +53,8 @@ pub struct DownloadStats {
     /// Steam asked for a password although a saved login was used.
     pub login_expired: bool,
     pub is_finished: bool,
+    /// `None` until the first counter growth reveals which phase this is.
+    pub disk_phase: Option<DiskPhase>,
 }
 
 impl DownloadStats {
@@ -76,6 +95,7 @@ pub struct ProgressTracker {
     samples: VecDeque<CounterSample>,
     downloading_message: String,
     smoothed_disk_speed_bytes_per_sec: f64,
+    smoothed_network_speed_bytes_per_sec: f64,
     smoothed_at_ms: u64,
     latest_t_ms: u64,
     latest_received_at: Instant,
@@ -88,6 +108,7 @@ impl ProgressTracker {
             samples: VecDeque::new(),
             downloading_message: String::new(),
             smoothed_disk_speed_bytes_per_sec: 0.0,
+            smoothed_network_speed_bytes_per_sec: 0.0,
             smoothed_at_ms: 0,
             latest_t_ms: 0,
             latest_received_at: Instant::now(),
@@ -161,6 +182,9 @@ impl ProgressTracker {
             Event::DepotStart { depot_id } => {
                 self.downloading_message = format!("Downloading depot {depot_id}");
                 self.stats.status_message = self.downloading_message.clone();
+                if !self.stats.depot_ids.contains(&depot_id) {
+                    self.stats.depot_ids.push(depot_id);
+                }
             }
             Event::Progress {
                 network_bytes,
@@ -205,6 +229,24 @@ impl ProgressTracker {
         verified_bytes: u64,
         t_ms: u64,
     ) {
+        let current_phase = if written_bytes > self.stats.written_bytes {
+            Some(DiskPhase::Writing)
+        } else if verified_bytes > self.stats.verified_bytes {
+            Some(DiskPhase::Verifying)
+        } else {
+            None
+        };
+        if let Some(phase) = current_phase {
+            if self.stats.disk_phase.is_some_and(|previous| previous != phase) {
+                // Verifying and writing run at very different rates; starting
+                // a fresh window and average keeps one from skewing the other.
+                self.samples.clear();
+                self.smoothed_disk_speed_bytes_per_sec = 0.0;
+                self.smoothed_network_speed_bytes_per_sec = 0.0;
+            }
+            self.stats.disk_phase = Some(phase);
+        }
+
         self.stats.network_bytes = network_bytes;
         self.stats.written_bytes = written_bytes;
         self.stats.verified_bytes = verified_bytes;
@@ -231,7 +273,7 @@ impl ProgressTracker {
             return;
         };
         let elapsed_ms = now_ms.saturating_sub(oldest.t_ms);
-        if elapsed_ms == 0 {
+        if elapsed_ms < MIN_SPEED_SAMPLE_SPAN_MS {
             return;
         }
         let elapsed_secs = elapsed_ms as f64 / 1000.0;
@@ -241,34 +283,67 @@ impl ProgressTracker {
             - oldest.completed_uncompressed_bytes)
             as f64
             / elapsed_secs;
-        self.smooth_disk_speed(now_ms);
+        self.smooth_speeds(now_ms);
         self.stats.eta = self.estimate_remaining_time();
     }
 
-    /// Exponential moving average of the disk speed, so the ETA does not
-    /// jump with every window's momentary rate.
-    fn smooth_disk_speed(&mut self, now_ms: u64) {
+    /// Exponential moving average of both speeds, so the ETA does not jump
+    /// with every window's momentary rate.
+    fn smooth_speeds(&mut self, now_ms: u64) {
         let elapsed_secs = now_ms.saturating_sub(self.smoothed_at_ms) as f64 / 1000.0;
         self.smoothed_at_ms = now_ms;
-        if self.smoothed_disk_speed_bytes_per_sec == 0.0 {
-            self.smoothed_disk_speed_bytes_per_sec = self.stats.disk_speed_bytes_per_sec;
+        Self::smooth_rate(
+            self.stats.disk_speed_bytes_per_sec,
+            &mut self.smoothed_disk_speed_bytes_per_sec,
+            elapsed_secs,
+        );
+        Self::smooth_rate(
+            self.stats.download_speed_bytes_per_sec,
+            &mut self.smoothed_network_speed_bytes_per_sec,
+            elapsed_secs,
+        );
+    }
+
+    fn smooth_rate(current: f64, smoothed: &mut f64, elapsed_secs: f64) {
+        if *smoothed == 0.0 {
+            *smoothed = current;
             return;
         }
         let weight = 1.0 - (-elapsed_secs / ETA_SMOOTHING_SECS).exp();
-        self.smoothed_disk_speed_bytes_per_sec +=
-            weight * (self.stats.disk_speed_bytes_per_sec - self.smoothed_disk_speed_bytes_per_sec);
+        *smoothed += weight * (current - *smoothed);
     }
 
+    /// The disk write and the network receive are both required to finish,
+    /// so ETA is whichever of the two is presently the slower bottleneck.
     fn estimate_remaining_time(&self) -> Option<Duration> {
-        let remaining_bytes = self
+        let remaining_uncompressed = self
             .stats
             .total_uncompressed_bytes
             .saturating_sub(self.stats.completed_uncompressed_bytes());
-        if self.stats.disk_speed_bytes_per_sec <= 0.0 {
-            return None;
-        }
-        Duration::try_from_secs_f64(remaining_bytes as f64 / self.smoothed_disk_speed_bytes_per_sec)
-            .ok()
+        // Gated on the raw, current-window speed rather than the smoothed
+        // one: a stall should hide the ETA right away instead of waiting for
+        // the average to decay toward zero.
+        let disk_eta = (self.stats.disk_speed_bytes_per_sec > 0.0).then(|| {
+            Duration::try_from_secs_f64(
+                remaining_uncompressed as f64 / self.smoothed_disk_speed_bytes_per_sec,
+            )
+        });
+
+        let remaining_network = self
+            .stats
+            .network_total_bytes()
+            .saturating_sub(self.stats.network_bytes);
+        let network_eta = (self.stats.download_speed_bytes_per_sec > 0.0).then(|| {
+            Duration::try_from_secs_f64(
+                remaining_network as f64 / self.smoothed_network_speed_bytes_per_sec,
+            )
+        });
+
+        [disk_eta, network_eta]
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .max()
     }
 }
 
@@ -315,9 +390,12 @@ mod tests {
         let stats = tracker.stats();
         assert_eq!(stats.download_speed_bytes_per_sec, 100_000.0);
         assert_eq!(stats.disk_speed_bytes_per_sec, 400_000.0);
+        // Compressed bytes remaining (network_total_bytes is the full plan
+        // here, since nothing was pre-verified) over the network speed is the
+        // slower of the two bottlenecks, so it wins over the disk-only ETA.
         assert_eq!(
             stats.eta,
-            Some(Duration::from_secs_f64(1_600_000.0 / 400_000.0))
+            Some(Duration::from_secs_f64(900_000.0 / 100_000.0))
         );
     }
 
