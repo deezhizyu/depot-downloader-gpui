@@ -20,7 +20,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             binary: depot-downloader-gpui.exe
           - name: macos-x64
-            os: macos-13
+            os: macos-latest
             target: x86_64-apple-darwin
             binary: depot-downloader-gpui
           - name: macos-arm64
@@ -35,7 +35,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -78,7 +78,7 @@ jobs:
             zip "../$archive" "${{ matrix.binary }}"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: depot-downloader-gpui-${{ matrix.name }}
           path: depot-downloader-gpui-${{ matrix.name }}.zip
@@ -87,13 +87,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*.zip
           generate_release_notes: true
